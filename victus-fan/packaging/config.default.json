@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "poll_interval_sec": 2,
+  "low_battery_pct": 20,
+  "override": "policy",
+  "profile_map": {
+    "performance": "performance",
+    "balanced": "balanced",
+    "quiet": "power-saver",
+    "cool": "power-saver",
+    "low-power": "power-saver"
+  },
+  "profiles": {
+    "performance": { "always_max": true },
+    "balanced":    { "cpu_on": 85, "cpu_off": 75, "igpu_on": 70, "igpu_off": 60, "dgpu_on": 72, "dgpu_off": 62 },
+    "power-saver": { "cpu_on": 90, "cpu_off": 80, "igpu_on": 78, "igpu_off": 68, "dgpu_on": 80, "dgpu_off": 70 }
+  }
+}

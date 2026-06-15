@@ -1,0 +1,21 @@
+[Unit]
+Description=Victus Fan Controller (userspace hp-wmi two-state fan daemon)
+Documentation=file:///usr/share/doc/victus-fan/README.md
+# Start once the system is fully up; hp-wmi/hwmon is available well before this.
+After=multi-user.target
+
+[Service]
+Type=simple
+# Daemon runs as root: it must write sysfs (pwm1_enable) and /run/victus-fan.
+User=root
+ExecStart=/usr/lib/victus-fan/victus-fand
+# Keep the controller alive across transient errors; the daemon itself also
+# guards every loop, but a hard crash should still be recovered.
+Restart=always
+RestartSec=3
+# The daemon traps SIGTERM/SIGINT and writes "2" (AUTO) to pwm1_enable on exit,
+# handing the fans back to the HP firmware curve. No ExecStopPost is required:
+# relying on the daemon avoids hard-coding a hwmon path that can renumber.
+
+[Install]
+WantedBy=multi-user.target
