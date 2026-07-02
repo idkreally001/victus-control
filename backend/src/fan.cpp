@@ -54,7 +54,7 @@ struct CpuSampleTimes {
 static std::mutex cpu_usage_mutex;
 static std::optional<CpuSampleTimes> previous_cpu_times;
 
-static constexpr int kBetterAutoMinRpm = 2600;
+static constexpr int kBetterAutoMinRpm = 2000;
 static constexpr std::array<int, 2> kBetterAutoMaxFallback = {5800, 6100};
 static constexpr int kBetterAutoSteps = 8;
 static constexpr std::chrono::seconds kBetterAutoTick{2};
@@ -445,8 +445,11 @@ static std::array<int, 2> rpm_for_level(int level)
 
 static int level_from_snapshot(const ThermalSnapshot &snapshot, int previous_level)
 {
-    const std::array<double, 7> temp_thresholds = {45.0, 55.0, 65.0, 70.0, 75.0, 80.0, 84.0};
-    const std::array<double, 7> usage_thresholds = {15.0, 20.0, 25.0, 35.0, 45.0, 55.0, 65.0};
+    // Levels 1-8 map to ~2000→max RPM. Thresholds define boundaries between consecutive levels.
+    // Temp: <45°C=L1(silent), 45-54=L2, 54-62=L3, 62-68=L4, 68-73=L5, 73-78=L6, 78-83=L7, >83=L8(max)
+    // Usage: low-usage background noise won't spin fans; only sustained load matters
+    const std::array<double, 7> temp_thresholds = {45.0, 54.0, 62.0, 68.0, 73.0, 78.0, 83.0};
+    const std::array<double, 7> usage_thresholds = {30.0, 45.0, 55.0, 65.0, 75.0, 85.0, 92.0};
 
     double hottest = 0.0;
     bool have_temp = false;
@@ -628,8 +631,8 @@ static std::string write_hw_fan_mode(const std::string &mode)
 static void better_auto_worker()
 {
     std::cout << "better-auto: control loop started" << std::endl;
-    int current_level = 3;
-    int sensor_level = 3;
+    int current_level = 1;
+    int sensor_level = 1;
     auto last_apply = std::chrono::steady_clock::time_point::min();
     better_auto_last_manual_assert = std::chrono::steady_clock::time_point::min();
     auto cooldown_until = std::chrono::steady_clock::time_point::min();

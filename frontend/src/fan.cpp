@@ -53,11 +53,15 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
     gtk_widget_set_halign(fan2_speed_label, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(fan_page), fan2_speed_label);
 
+    cpu_temp_label = gtk_label_new("CPU Temp: N/A °C");
+    gtk_widget_set_halign(cpu_temp_label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(fan_page), cpu_temp_label);
+
     // Initial UI state update
     update_ui_from_system_state();
     update_fan_speeds();
 
-    // Set up a timer to periodically update fan speeds
+    // Set up a timer to periodically update fan speeds and temps
     g_timeout_add_seconds(2, [](gpointer data) -> gboolean {
         static_cast<VictusFanControl*>(data)->update_fan_speeds();
         return G_SOURCE_CONTINUE;
@@ -103,15 +107,21 @@ void VictusFanControl::update_ui_from_system_state()
 void VictusFanControl::update_fan_speeds()
 {
     auto response1 = socket_client->send_command_async(GET_FAN_SPEED, "1");
+    auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
+    auto response_temp = socket_client->send_command_async(GET_CPU_TEMP);
+
     std::string fan1_speed = response1.get();
     if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
 
-    auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
     std::string fan2_speed = response2.get();
     if (fan2_speed.find("ERROR") != std::string::npos) fan2_speed = "N/A";
 
+    std::string cpu_temp = response_temp.get();
+    if (cpu_temp.find("ERROR") != std::string::npos) cpu_temp = "N/A";
+
     gtk_label_set_text(GTK_LABEL(fan1_speed_label), ("Fan 1 Speed: " + fan1_speed + " RPM").c_str());
     gtk_label_set_text(GTK_LABEL(fan2_speed_label), ("Fan 2 Speed: " + fan2_speed + " RPM").c_str());
+    gtk_label_set_text(GTK_LABEL(cpu_temp_label), ("CPU Temp: " + cpu_temp + " °C").c_str());
 }
 
 void VictusFanControl::set_fan_rpm(int level)

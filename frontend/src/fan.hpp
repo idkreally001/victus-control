@@ -25,6 +25,7 @@ private:
 	GtkWidget *state_label;
 	GtkWidget *fan1_speed_label;
 	GtkWidget *fan2_speed_label;
+	GtkWidget *cpu_temp_label;
 
 	void update_fan_speeds();
 	void update_ui_from_system_state();
