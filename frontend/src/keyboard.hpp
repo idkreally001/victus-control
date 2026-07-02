@@ -18,7 +18,8 @@ public:
 
 private:
   GtkWidget *toggle_button;
-  GtkColorChooser *color_chooser;
+  GtkWidget *color_button;
+  GdkRGBA current_single_color;
   GtkWidget *zone_selector;
   GtkWidget *apply_button;
   GtkLabel *current_color_label;
@@ -29,8 +30,7 @@ private:
   GtkWidget *keyboard_visual; // DrawingArea for visual representation
   GtkWidget *zone_container;  // Container for zone controls
   GdkRGBA zone_colors[4];     // Current colors for each zone
-  GtkColorChooser
-      *zone_choosers[4]; // Individual color choosers for 4-zone mode
+  GtkColorDialog *zone_choosers[4];
 
   // Preset system
   GtkWidget *preset_dropdown;
@@ -67,6 +67,7 @@ private:
   static void on_keyboard_click(GtkGestureClick *gesture, int n_press, double x,
                                 double y, gpointer data);
   static void on_toggle_clicked(GtkWidget *widget, gpointer data);
+  static void on_choose_color_clicked(GtkWidget *widget, gpointer data);
   static void on_apply_color_clicked(GtkWidget *widget, gpointer data);
   static void on_zone_color_changed(GtkColorButton *widget, gpointer data);
   static void on_preset_changed(GtkComboBoxText *widget, gpointer data);
