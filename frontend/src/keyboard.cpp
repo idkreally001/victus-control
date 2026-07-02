@@ -35,19 +35,19 @@ bool parse_rgb_triplet(const std::string &rgb_string, GdkRGBA *color) {
       blue > 255)
     return false;
 
-  *color = {red / 255.0, green / 255.0, blue / 255.0, 1.0};
+  *color = {static_cast<float>(red / 255.0), static_cast<float>(green / 255.0), static_cast<float>(blue / 255.0), 1.0f};
   return true;
 }
 
 bool parse_hex_color(const std::string &hex, GdkRGBA *color) {
-  if (hex.size() < 6)
+  if (hex.size() != 6)
     return false;
 
   try {
     int red = std::stoi(hex.substr(0, 2), nullptr, 16);
     int green = std::stoi(hex.substr(2, 2), nullptr, 16);
     int blue = std::stoi(hex.substr(4, 2), nullptr, 16);
-    *color = {red / 255.0, green / 255.0, blue / 255.0, 1.0};
+    *color = {static_cast<float>(red / 255.0), static_cast<float>(green / 255.0), static_cast<float>(blue / 255.0), 1.0f};
   } catch (...) {
     return false;
   }

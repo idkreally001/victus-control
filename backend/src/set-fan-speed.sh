@@ -24,7 +24,7 @@ if ! [[ "$SPEED" =~ ^[0-9]+$ ]]; then
 fi
 
 HWMON_BASE="/sys/devices/platform/hp-wmi/hwmon"
-HWMON_PATH=$(find "$HWMON_BASE" -mindepth 1 -type d -name "hwmon*" | head -n 1)
+HWMON_PATH=$(find "$HWMON_BASE" -mindepth 1 -maxdepth 1 -type d -name "hwmon*" | head -n 1)
 
 if [ -z "$HWMON_PATH" ]; then
     echo "Error: Hwmon directory not found."

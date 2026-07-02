@@ -57,8 +57,12 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
     gtk_widget_set_halign(cpu_temp_label, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(fan_page), cpu_temp_label);
 
-    // Initial UI state update
+    // Block "changed" signal during init so set_active_id doesn't fire
+    // on_mode_changed and reset fan speeds with the slider's default value.
+    g_signal_handlers_block_by_func(mode_selector, (gpointer)on_mode_changed, this);
     update_ui_from_system_state();
+    g_signal_handlers_unblock_by_func(mode_selector, (gpointer)on_mode_changed, this);
+
     update_fan_speeds();
 
     // Set up a timer to periodically update fan speeds and temps
@@ -181,32 +185,28 @@ void VictusFanControl::set_fan_rpm(int level)
 void VictusFanControl::on_mode_changed(GtkComboBox *widget, gpointer data)
 {
     VictusFanControl *self = static_cast<VictusFanControl*>(data);
-    gchar *mode = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(widget));
+    // get_active_id returns a const pointer owned by GTK — copy immediately, never free
+    const gchar *active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(widget));
+    if (!active_id) return;
+    std::string mode_str(active_id);
 
-    if (mode) {
-        std::string mode_str(mode);
-        
-        // Send the mode command and wait for it to complete.
-        auto result = self->socket_client->send_command_async(SET_FAN_MODE, mode_str).get();
+    // Send the mode command and wait for it to complete.
+    auto result = self->socket_client->send_command_async(SET_FAN_MODE, mode_str).get();
 
-        if (result == "OK") {
-            // If we are entering manual mode, now we can safely set the fan speed.
-            if (mode_str == "MANUAL") {
-                int level = static_cast<int>(gtk_range_get_value(GTK_RANGE(self->speed_slider)));
-                self->set_fan_rpm(level);
-            } else if (mode_str == "BETTER_AUTO") {
-                gtk_widget_set_sensitive(self->speed_slider, FALSE);
-                gtk_widget_set_sensitive(self->slider_label, FALSE);
-            }
-        } else {
-            std::cerr << "Failed to set fan mode: " << result << std::endl;
+    if (result == "OK") {
+        if (mode_str == "MANUAL") {
+            int level = static_cast<int>(gtk_range_get_value(GTK_RANGE(self->speed_slider)));
+            self->set_fan_rpm(level);
+        } else if (mode_str == "BETTER_AUTO") {
+            gtk_widget_set_sensitive(self->speed_slider, FALSE);
+            gtk_widget_set_sensitive(self->slider_label, FALSE);
         }
-        
-        g_free(mode);
-        
-        // After all commands are sent, update the UI to reflect the final state.
-        self->update_ui_from_system_state();
+    } else {
+        std::cerr << "Failed to set fan mode: " << result << std::endl;
     }
+
+    // After all commands are sent, update the UI to reflect the final state.
+    self->update_ui_from_system_state();
 }
 
 void VictusFanControl::on_speed_slider_changed(GtkRange *range, gpointer data)
