@@ -702,8 +702,15 @@ static void better_auto_worker()
             last_apply = now;
         }
 
+        // Cooldown grace: once the machine has recently run hot, hold a modest
+        // floor (kBetterAutoCooldownLevel) for a short window so a brief temp
+        // dip doesn't drop the fans only to re-spin seconds later. The floor is
+        // fixed at the trigger level and the window is refreshed only while the
+        // sensor is still hot — it must NOT ratchet up to the running peak or
+        // re-arm forever, or the fans stay pinned high through the whole
+        // session and never idle back down.
         if (sensor_level >= kBetterAutoCooldownLevel) {
-            cooldown_level = std::max(cooldown_level, current_level);
+            cooldown_level = kBetterAutoCooldownLevel;
             cooldown_until = now + kBetterAutoCooldown;
         }
 
