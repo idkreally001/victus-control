@@ -2,8 +2,24 @@
 set -euo pipefail
 
 module_name="hp-wmi-fan-and-backlight-control"
-module_version="0.0.2"
 log_prefix="[victus-healthcheck]"
+
+# Resolve the installed DKMS version dynamically so a version bump in the
+# module's dkms.conf never leaves this healthcheck pinned to a stale number.
+resolve_module_version() {
+    local version=""
+    if command -v dkms >/dev/null 2>&1; then
+        version="$(dkms status -m "${module_name}" 2>/dev/null \
+            | sed -n 's#^'"${module_name}"'[/,] *\([^,: ]*\).*#\1#p' \
+            | head -n 1)"
+    fi
+    if [[ -z "${version}" ]]; then
+        version="$(find /usr/src -maxdepth 1 -type d \
+            -name "${module_name}-*" 2>/dev/null \
+            | sed -n "s#.*/${module_name}-##p" | sort -V | tail -n 1)"
+    fi
+    printf '%s' "${version}"
+}
 
 hp_wmi_fan_interface_ready() {
     local hwmon_path
@@ -28,17 +44,24 @@ if ! command -v dkms >/dev/null 2>&1; then
 fi
 
 current_kernel="$(uname -r)"
+module_version="$(resolve_module_version)"
 
-status_output="$(dkms status -m "${module_name}" -v "${module_version}" || true)"
-if [[ ! "$status_output" =~ ${current_kernel}.*installed ]]; then
-    echo "$log_prefix module not built for ${current_kernel}; attempting dkms autoinstall" >&2
-    if ! dkms autoinstall -m "${module_name}" -v "${module_version}" -k "${current_kernel}" >/dev/null 2>&1; then
-        echo "$log_prefix dkms autoinstall failed; retrying targeted install" >&2
-        dkms install "${module_name}/${module_version}" -k "${current_kernel}" >/dev/null 2>&1 || true
+if [[ -z "${module_version}" ]]; then
+    echo "$log_prefix warning: could not resolve ${module_name} DKMS version; skipping build check" >&2
+else
+    status_output="$(dkms status -m "${module_name}" -v "${module_version}" || true)"
+    if [[ ! "$status_output" =~ ${current_kernel}.*installed ]]; then
+        echo "$log_prefix module ${module_version} not built for ${current_kernel}; attempting dkms autoinstall" >&2
+        if ! dkms autoinstall -m "${module_name}" -v "${module_version}" -k "${current_kernel}" >/dev/null 2>&1; then
+            echo "$log_prefix dkms autoinstall failed; retrying targeted install" >&2
+            dkms install "${module_name}/${module_version}" -k "${current_kernel}" >/dev/null 2>&1 || true
+        fi
     fi
 fi
 
-if ! modprobe --show-depends hp_wmi | grep -q '/extra/hp-wmi\.ko'; then
+# DKMS installs the built module under /updates/dkms (Arch) or /extra (some
+# distros); accept either rather than pinning to one layout.
+if ! modprobe --show-depends hp_wmi | grep -Eq '/(updates/dkms|extra)/hp-wmi\.ko'; then
     echo "$log_prefix warning: modprobe hp_wmi is not resolving to the DKMS-installed module" >&2
 fi
 

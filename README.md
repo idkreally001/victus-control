@@ -108,11 +108,11 @@ sudo meson install -C build
 - The installer fetches `hp-wmi-fan-and-backlight-control`; it’s git-ignored to keep the repo lean.
 
 ## Troubleshooting
-- **Fans ignore commands**: ensure the DKMS module is loaded (`dkms status | grep hp-wmi-fan-and-backlight-control`, `modprobe --show-depends hp_wmi | tail -n1` should point at `/extra/hp-wmi.ko.xz`).
+- **Fans ignore commands**: ensure the DKMS module is loaded (`dkms status | grep hp-wmi-fan-and-backlight-control`, `modprobe --show-depends hp_wmi | tail -n1` should point at the DKMS-built `hp-wmi.ko` under `/updates/dkms/` on Arch or `/extra/` on other distros).
 - **Permission errors**: confirm `victus` group membership (`groups $USER`), then re-run the installer or `sudo usermod -aG victus $USER`.
 - **Socket missing**: `sudo systemd-tmpfiles --create`; `sudo systemctl restart victus-backend.service`.
 - **GNOME extension missing after install**: log out/in once, then run `gnome-extensions enable victus-control@victus`.
-- **Uninstall**: `sudo systemctl disable --now victus-backend` and `sudo dkms remove hp-wmi-fan-and-backlight-control/0.0.2 --all`.
+- **Uninstall**: `sudo systemctl disable --now victus-backend` and `sudo dkms remove hp-wmi-fan-and-backlight-control/$(dkms status -m hp-wmi-fan-and-backlight-control | sed -n 's#.*/\([^,]*\),.*#\1#p' | head -n1) --all` (or substitute the version shown by `dkms status`).
 
 ## Contributing
 See `AGENTS.md` for coding style, testing, and PR expectations. Hardware validation notes are welcome in PR descriptions.

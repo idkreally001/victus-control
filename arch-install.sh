@@ -11,7 +11,18 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}"
 
 module_name="hp-wmi-fan-and-backlight-control"
-module_version="0.0.2"
+# Populated from the cloned module's dkms.conf so a version bump upstream
+# never leaves this installer pinned to a stale number.
+module_version=""
+
+read_module_version_from_dkms_conf() {
+    local conf="$1"
+    [[ -r "${conf}" ]] || return 1
+    local version
+    version="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'\'']*\([^"'\'' ]*\).*/\1/p' "${conf}" | head -n 1)"
+    [[ -n "${version}" ]] || return 1
+    printf '%s' "${version}"
+}
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
@@ -42,8 +53,8 @@ reload_patched_hp_wmi() {
     echo "--> Reloading patched hp-wmi module..."
     modprobe led_class_multicolor >/dev/null 2>&1 || true
 
-    if ! modprobe --show-depends hp_wmi | grep -q '/extra/hp-wmi\.ko'; then
-        echo "Error: modprobe hp_wmi is not resolving to the DKMS-installed module in /extra." >&2
+    if ! modprobe --show-depends hp_wmi | grep -Eq '/(updates/dkms|extra)/hp-wmi\.ko'; then
+        echo "Error: modprobe hp_wmi is not resolving to the DKMS-installed module." >&2
         return 1
     fi
 
@@ -178,6 +189,12 @@ install_hp_wmi_dkms() {
     fi
 
     pushd "${wmi_repo}" >/dev/null
+
+    module_version="$(read_module_version_from_dkms_conf dkms.conf)" || {
+        echo "Error: could not read PACKAGE_VERSION from dkms.conf." >&2
+        exit 1
+    }
+    echo "Detected hp-wmi module version ${module_version}."
 
     if dkms status -m "${module_name}" -v "${module_version}" >/dev/null 2>&1; then
         dkms remove "${module_name}/${module_version}" --all || true
