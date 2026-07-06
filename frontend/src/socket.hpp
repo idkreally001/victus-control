@@ -20,7 +20,8 @@ enum ServerCommands
   GET_KBD_BRIGHTNESS,
   SET_KBD_BRIGHTNESS,
   GET_KEYBOARD_TYPE,
-  GET_CPU_TEMP
+  GET_CPU_TEMP,
+  GET_GPU_TEMP
 };
 
 class VictusSocketClient

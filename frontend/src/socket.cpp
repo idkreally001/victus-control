@@ -81,6 +81,7 @@ VictusSocketClient::VictusSocketClient(const std::string &path) : socket_path(pa
       {SET_KBD_BRIGHTNESS, "SET_KBD_BRIGHTNESS"},
       {GET_KEYBOARD_TYPE, "GET_KEYBOARD_TYPE"},
       {GET_CPU_TEMP, "GET_CPU_TEMP"},
+      {GET_GPU_TEMP, "GET_GPU_TEMP"},
   };
 
   // Don't connect here, connect on first command
