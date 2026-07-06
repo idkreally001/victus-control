@@ -170,6 +170,33 @@ install_helpers_and_sudoers() {
     fi
 }
 
+install_temperature_monitor() {
+    echo "--> Installing temperature monitor (per-user notifications)..."
+    install -m 0755 monitor/victus-monitor.py /usr/bin/victus-monitor
+    install -D -m 0644 monitor/victus-monitor.service \
+        /usr/lib/systemd/user/victus-monitor.service
+    systemctl daemon-reload
+
+    # The monitor runs in the desktop user's session (needs their D-Bus for
+    # notifications), so enable it for the invoking user, not root.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local uid
+        uid="$(id -u "${SUDO_USER}")"
+        if sudo -u "${SUDO_USER}" \
+               XDG_RUNTIME_DIR="/run/user/${uid}" \
+               systemctl --user enable --now victus-monitor.service 2>/dev/null; then
+            echo "Enabled victus-monitor.service for user '${SUDO_USER}'."
+        else
+            echo "Note: could not enable victus-monitor for '${SUDO_USER}' now" \
+                 "(no active session?). It will start on next login."
+        fi
+    else
+        echo "Note: run the installer with sudo from your desktop user to" \
+             "auto-enable the temperature monitor. Otherwise enable it with:" \
+             "systemctl --user enable --now victus-monitor.service"
+    fi
+}
+
 install_hp_wmi_dkms() {
     local wmi_root="wmi-project"
     local wmi_repo="${wmi_root}/hp-wmi-fan-and-backlight-control"
@@ -260,6 +287,7 @@ echo "--> Installing required packages..."
 install_arch_dependencies
 ensure_users_and_groups
 install_helpers_and_sudoers
+install_temperature_monitor
 install_hp_wmi_dkms
 build_and_install_app
 start_services
