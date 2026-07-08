@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -29,6 +30,10 @@ constexpr const char *kSingleZoneBrightnessPath =
 constexpr const char *kRgbZoneWriterPath = "/usr/bin/set-rgb-zone.sh";
 constexpr const char *kSudoPath = "/usr/bin/sudo";
 
+// Colors stashed when a four-zone keyboard is toggled off, so it can be
+// restored on toggle-on. Empty until the first off with lit zones.
+std::optional<std::array<std::string, kFourZoneCount>> g_fourzone_saved_colors;
+
 bool omen_4zone_exists() {
   struct stat buffer;
   return stat(kFourZoneZone0Path, &buffer) == 0;
@@ -47,8 +52,20 @@ std::string fourzone_zone_path(int zone) {
   return std::string(kFourZoneZonePathPrefix) + std::to_string(zone);
 }
 
-bool parse_hex_color(const std::string &hex, std::array<int, 3> *rgb) {
+bool is_valid_hex_color(const std::string &hex) {
   if (hex.size() != 6)
+    return false;
+
+  for (char ch : hex) {
+    if (!std::isxdigit(static_cast<unsigned char>(ch)))
+      return false;
+  }
+
+  return true;
+}
+
+bool parse_hex_color(const std::string &hex, std::array<int, 3> *rgb) {
+  if (!is_valid_hex_color(hex))
     return false;
 
   try {
@@ -92,18 +109,6 @@ std::string read_text_file(const std::string &path) {
   std::stringstream buffer;
   buffer << file.rdbuf();
   return trim_trailing_whitespace(buffer.str());
-}
-
-bool is_valid_hex_color(const std::string &hex) {
-  if (hex.size() != 6)
-    return false;
-
-  for (char ch : hex) {
-    if (!std::isxdigit(static_cast<unsigned char>(ch)))
-      return false;
-  }
-
-  return true;
 }
 
 int run_helper_command(const std::vector<std::string> &args) {
@@ -280,8 +285,50 @@ std::string set_keyboard_brightness(const std::string &value) {
   if (!parse_bounded_int(value, 0, 255, &brightness_value))
     return "ERROR: Invalid keyboard brightness";
 
-  if (omen_4zone_exists())
+  // Four-zone Omen keyboards have no brightness sysfs; the LEDs are driven only
+  // by per-zone RGB. Emulate the on/off toggle: brightness 0 stashes the
+  // current colors and blacks every zone; a non-zero value restores them.
+  if (omen_4zone_exists()) {
+    if (brightness_value == 0) {
+      std::array<std::string, kFourZoneCount> stashed;
+      for (int zone = 0; zone < kFourZoneCount; zone++) {
+        std::string hex = read_text_file(fourzone_zone_path(zone));
+        if (!is_valid_hex_color(hex))
+          hex = "FFFFFF";
+        stashed[zone] = hex;
+      }
+      // Only overwrite the saved colors if the keyboard is currently lit, so a
+      // double "off" doesn't stash all-black and lose the real colors.
+      bool any_lit = false;
+      for (const auto &hex : stashed) {
+        if (hex != "000000") {
+          any_lit = true;
+          break;
+        }
+      }
+      if (any_lit)
+        g_fourzone_saved_colors = stashed;
+
+      for (int zone = 0; zone < kFourZoneCount; zone++) {
+        std::string result = write_rgb_zone_with_helper(zone, "000000");
+        if (result != "OK")
+          return result;
+      }
+      return "OK";
+    }
+
+    // Non-zero brightness: restore the stashed colors if we have them.
+    if (!g_fourzone_saved_colors)
+      return "OK"; // nothing to restore; leave whatever is set
+
+    for (int zone = 0; zone < kFourZoneCount; zone++) {
+      std::string result =
+          write_rgb_zone_with_helper(zone, (*g_fourzone_saved_colors)[zone]);
+      if (result != "OK")
+        return result;
+    }
     return "OK";
+  }
 
   std::ofstream brightness(kSingleZoneBrightnessPath);
   if (brightness) {
