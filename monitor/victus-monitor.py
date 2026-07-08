@@ -32,8 +32,6 @@ POLL_INTERVAL_S = 3.0
 # "critical" would never fire.
 CPU_HOT_C = 83.0        # cooling-not-engaged warning trigger
 GPU_HOT_C = 83.0
-CPU_CRITICAL_C = 95.0
-GPU_CRITICAL_C = 85.0
 
 # A fan is considered "not spinning up" below this RPM.
 FAN_IDLE_RPM = 2200
@@ -45,6 +43,15 @@ REARM_MARGIN_C = 5.0
 
 # Hard rate limit per category regardless of hysteresis (seconds).
 RATE_LIMIT_S = 60.0
+
+# Sustained-temperature alert thresholds: fire if temp stays above threshold
+# for the given duration continuously.
+CPU_SUSTAINED_85_SECS = 12.0
+CPU_SUSTAINED_90_SECS = 9.0
+CPU_SUSTAINED_95_SECS = 6.0
+CPU_SUSTAINED_100_SECS = 3.0
+GPU_SUSTAINED_80_SECS = 12.0
+GPU_SUSTAINED_85_SECS = 9.0
 
 APP_NAME = "Victus Control"
 
@@ -132,6 +139,40 @@ class Category:
         return True
 
 
+class SustainedAlert:
+    """Fires when temp stays above threshold continuously for required_secs.
+
+    Resets the timer as soon as temp drops below (threshold - REARM_MARGIN_C),
+    so a brief dip prevents a re-fire until the temp climbs and holds again.
+    Rate-limited independently per instance.
+    """
+
+    def __init__(self, threshold_c, required_secs):
+        self.threshold_c = threshold_c
+        self.required_secs = required_secs
+        self.above_since = None   # monotonic timestamp when streak started
+        self.last_fired = 0.0
+
+    def update(self, temp_c, now):
+        """Call every poll tick. Returns True exactly when alert should fire."""
+        if temp_c is None:
+            self.above_since = None
+            return False
+
+        if temp_c >= self.threshold_c:
+            if self.above_since is None:
+                self.above_since = now
+            elapsed = now - self.above_since
+            if elapsed >= self.required_secs and now - self.last_fired >= RATE_LIMIT_S:
+                self.last_fired = now
+                self.above_since = None   # reset so it must hold again to re-fire
+                return True
+        elif temp_c <= self.threshold_c - REARM_MARGIN_C:
+            self.above_since = None
+
+        return False
+
+
 def main():
     if shutil.which("notify-send") is None:
         print("victus-monitor: notify-send not found (install libnotify); exiting",
@@ -139,8 +180,13 @@ def main():
         return 1
 
     cooling = Category(min(CPU_HOT_C, GPU_HOT_C))
-    cpu_crit = Category(CPU_CRITICAL_C)
-    gpu_crit = Category(GPU_CRITICAL_C)
+
+    cpu_85 = SustainedAlert(85.0, CPU_SUSTAINED_85_SECS)
+    cpu_90 = SustainedAlert(90.0, CPU_SUSTAINED_90_SECS)
+    cpu_95 = SustainedAlert(95.0, CPU_SUSTAINED_95_SECS)
+    cpu_100 = SustainedAlert(100.0, CPU_SUSTAINED_100_SECS)
+    gpu_80 = SustainedAlert(80.0, GPU_SUSTAINED_80_SECS)
+    gpu_85 = SustainedAlert(85.0, GPU_SUSTAINED_85_SECS)
 
     print("victus-monitor: watching temperatures", file=sys.stderr)
 
@@ -153,16 +199,36 @@ def main():
         fan1 = parse_rpm(query("GET_FAN_SPEED 1"))
         fan2 = parse_rpm(query("GET_FAN_SPEED 2"))
 
-        # Critical temperature alerts (per component, mode-independent).
-        if cpu_crit.should_fire(cpu, now):
-            notify("CPU temperature critical",
-                   f"CPU is at {cpu:.0f} °C — this is very hot. Close heavy "
-                   f"workloads or check cooling.", critical=True)
+        # Sustained-temperature alerts (fire regardless of fan/mode state).
+        if cpu_85.update(cpu, now):
+            notify("CPU running hot",
+                   f"CPU above 85 °C for {CPU_SUSTAINED_85_SECS:.0f} s (now {cpu:.0f} °C). "
+                   f"Check active workloads.", critical=False)
 
-        if gpu_crit.should_fire(gpu, now):
-            notify("GPU temperature critical",
-                   f"GPU is at {gpu:.0f} °C — this is very hot. Close heavy "
-                   f"workloads or check cooling.", critical=True)
+        if cpu_90.update(cpu, now):
+            notify("CPU very hot",
+                   f"CPU above 90 °C for {CPU_SUSTAINED_90_SECS:.0f} s (now {cpu:.0f} °C). "
+                   f"Close heavy workloads.", critical=False)
+
+        if cpu_95.update(cpu, now):
+            notify("CPU critical temperature",
+                   f"CPU above 95 °C for {CPU_SUSTAINED_95_SECS:.0f} s (now {cpu:.0f} °C). "
+                   f"Close heavy workloads immediately.", critical=True)
+
+        if cpu_100.update(cpu, now):
+            notify("CPU dangerously hot",
+                   f"CPU above 100 °C for {CPU_SUSTAINED_100_SECS:.0f} s (now {cpu:.0f} °C). "
+                   f"System may throttle or shut down.", critical=True)
+
+        if gpu_80.update(gpu, now):
+            notify("GPU running hot",
+                   f"GPU above 80 °C for {GPU_SUSTAINED_80_SECS:.0f} s (now {gpu:.0f} °C). "
+                   f"Check active workloads.", critical=False)
+
+        if gpu_85.update(gpu, now):
+            notify("GPU critical temperature",
+                   f"GPU above 85 °C for {GPU_SUSTAINED_85_SECS:.0f} s (now {gpu:.0f} °C). "
+                   f"Close heavy workloads immediately.", critical=True)
 
         # Cooling-not-engaged warning: hot, but the fans aren't ramping — either
         # they're idling or the user is in MANUAL mode with low fan speeds.
