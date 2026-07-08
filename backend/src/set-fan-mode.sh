@@ -26,7 +26,9 @@ case "$mode" in
 esac
 
 HWMON_BASE="/sys/devices/platform/hp-wmi/hwmon"
-HWMON_PATH=$(find "$HWMON_BASE" -mindepth 1 -maxdepth 1 -type d -name "hwmon*" | head -n 1 || true)
+# Pick the highest-numbered hwmon dir to match the backend's util.cpp selection;
+# plain `head -n 1` follows readdir order and can disagree with the C++ side.
+HWMON_PATH=$(find "$HWMON_BASE" -mindepth 1 -maxdepth 1 -type d -name "hwmon*" | sort -V | tail -n 1 || true)
 
 if [[ -z "${HWMON_PATH}" ]]; then
     echo "Error: Hwmon directory not found under $HWMON_BASE." >&2
