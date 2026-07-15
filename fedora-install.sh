@@ -112,6 +112,8 @@ install_fedora_dependencies() {
         gcc-c++
         policycoreutils-python-utils
         sudo
+        python3
+        libnotify
     )
 
     dnf install -y "${packages[@]}"

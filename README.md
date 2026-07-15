@@ -28,6 +28,8 @@ Fan control and keyboard lighting for HP Victus / Omen laptops on Linux. Stock f
 
 If you can't load the patched `hp-wmi` DKMS module — most notably on **Ubuntu with Secure Boot enabled**, where unsigned out-of-tree modules are rejected — see [`victus-fan/`](victus-fan/). It is a self-contained **userspace** controller that drives the **stock** in-tree `hp-wmi` driver (two-state `pwm1_enable`, no kernel module), tying fan speed to your power profile and CPU / iGPU / NVIDIA temperature via a small daemon + CLI (no GUI). Tested on an HP Victus 15-fb0xxx running Ubuntu 26.04 — see [`victus-fan/README.md`](victus-fan/README.md).
 
+> **Pick one fan controller, not both.** `victus-fan` and the main `victus-backend` (installed by the DKMS installers above) both write the same `pwm1_enable` knob; running both at once makes them fight over the fans. Use `victus-fan` **instead of** the DKMS stack on machines where the patched module can't load — not alongside it.
+
 ## System Requirements
 - 64-bit Linux with `systemd`.
 - Supported installer targets:

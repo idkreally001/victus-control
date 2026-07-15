@@ -102,7 +102,7 @@ reload_patched_hp_wmi() {
 }
 
 install_arch_dependencies() {
-    local packages=(meson ninja gtk4 git dkms sudo)
+    local packages=(meson ninja gtk4 git dkms sudo python libnotify)
     declare -A header_packages=()
     local module_dir=""
     local pkgbase_path=""
