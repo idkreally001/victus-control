@@ -11,7 +11,18 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}"
 
 module_name="hp-wmi-fan-and-backlight-control"
-module_version="0.0.2"
+# Populated from the cloned module's dkms.conf so a version bump upstream
+# never leaves this installer pinned to a stale number.
+module_version=""
+
+read_module_version_from_dkms_conf() {
+    local conf="$1"
+    [[ -r "${conf}" ]] || return 1
+    local version
+    version="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'\'']*\([^"'\'' ]*\).*/\1/p' "${conf}" | head -n 1)"
+    [[ -n "${version}" ]] || return 1
+    printf '%s' "${version}"
+}
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
@@ -90,16 +101,34 @@ install_ubuntu_dependencies() {
     local current_kernel
     current_kernel="$(uname -r)"
 
+    # Keep apt fully non-interactive: -y alone does not suppress needrestart's
+    # whiptail dialog on Ubuntu 24.04 (triggered by the kernel-headers install),
+    # which would otherwise hang an unattended `sudo ./install.sh`.
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+
     apt-get update -q
     apt-get install -y \
         meson \
         ninja-build \
         libgtk-4-dev \
+        pkg-config \
         git \
         dkms \
         g++ \
         sudo \
-        "linux-headers-${current_kernel}"
+        python3 \
+        libnotify-bin
+
+    # The exact running-kernel headers are not always in the archive (kernel
+    # upgraded but not yet rebooted, or an HWE kernel), which would abort the
+    # whole install under `set -e`. Fall back to the generic meta-package.
+    if ! apt-get install -y "linux-headers-${current_kernel}"; then
+        echo "Warning: linux-headers-${current_kernel} unavailable; falling back to linux-headers-generic." >&2
+        echo "         If the DKMS build later fails, reboot into the kernel that matches the installed" >&2
+        echo "         headers and re-run this installer." >&2
+        apt-get install -y linux-headers-generic
+    fi
 }
 
 ensure_users_and_groups() {
@@ -149,6 +178,33 @@ install_helpers_and_sudoers() {
     fi
 }
 
+install_temperature_monitor() {
+    echo "--> Installing temperature monitor (per-user notifications)..."
+    install -m 0755 monitor/victus-monitor.py /usr/bin/victus-monitor
+    install -D -m 0644 monitor/victus-monitor.service \
+        /usr/lib/systemd/user/victus-monitor.service
+    systemctl daemon-reload
+
+    # The monitor runs in the desktop user's session (needs their D-Bus for
+    # notifications), so enable it for the invoking user, not root.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local uid
+        uid="$(id -u "${SUDO_USER}")"
+        if sudo -u "${SUDO_USER}" \
+               XDG_RUNTIME_DIR="/run/user/${uid}" \
+               systemctl --user enable --now victus-monitor.service 2>/dev/null; then
+            echo "Enabled victus-monitor.service for user '${SUDO_USER}'."
+        else
+            echo "Note: could not enable victus-monitor for '${SUDO_USER}' now" \
+                 "(no active session?). It will start on next login."
+        fi
+    else
+        echo "Note: run the installer with sudo from your desktop user to" \
+             "auto-enable the temperature monitor. Otherwise enable it with:" \
+             "systemctl --user enable --now victus-monitor.service"
+    fi
+}
+
 install_hp_wmi_dkms() {
     local wmi_root="wmi-project"
     local wmi_repo="${wmi_root}/hp-wmi-fan-and-backlight-control"
@@ -165,6 +221,12 @@ install_hp_wmi_dkms() {
     fi
 
     pushd "${wmi_repo}" >/dev/null
+
+    module_version="$(read_module_version_from_dkms_conf dkms.conf)" || {
+        echo "Error: could not read PACKAGE_VERSION from dkms.conf." >&2
+        exit 1
+    }
+    echo "Detected hp-wmi module version ${module_version}."
 
     if dkms status -m "${module_name}" -v "${module_version}" >/dev/null 2>&1; then
         dkms remove "${module_name}/${module_version}" --all || true
@@ -213,6 +275,7 @@ echo "--> Installing required packages..."
 install_ubuntu_dependencies
 ensure_users_and_groups
 install_helpers_and_sudoers
+install_temperature_monitor
 install_hp_wmi_dkms
 build_and_install_app
 start_services
