@@ -1,0 +1,5 @@
+# victus-fan runtime directory.
+# The daemon writes /run/victus-fan/status.json (mode 0644, world-readable) here
+# each poll loop. UIs (GTK app, GNOME extension, CLI) read that status file.
+# Type Path             Mode UID  GID  Age Argument
+d /run/victus-fan 0755 root root -

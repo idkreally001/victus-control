@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Jayesh Barman
+"""
+victus-fand — userspace fan controller daemon for HP Victus 15-fb0xxx.
+
+SAFETY-CRITICAL. Runs as root. Controls the laptop fans by writing ONLY the
+stock hp-wmi driver's pwm1_enable file (two-state: "0"=MAX, "2"=AUTO). It never
+writes platform_profile and never touches any other sysfs control.
+
+Design goals:
+  * Never die on a transient error: the whole loop body is wrapped in try/except.
+  * Never wake a suspended NVIDIA dGPU: nvidia-smi is only invoked when the PCI
+    device's runtime power status is "active".
+  * Always hand the fans back to firmware (pwm1_enable=2 / AUTO) on exit.
+  * Re-discover sysfs paths if a cached path disappears (hwmon numbering can move).
+
+Pure python3 stdlib only.
+"""
+
+import errno
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+DAEMON_VERSION = "1.0"
+
+CONFIG_PATH = "/etc/victus-fan/config.json"
+STATUS_PATH = "/run/victus-fan/status.json"
+
+HP_WMI_HWMON_GLOB_ROOT = "/sys/devices/platform/hp-wmi/hwmon"
+HWMON_CLASS_ROOT = "/sys/class/hwmon"
+POWER_SUPPLY_ROOT = "/sys/class/power_supply"
+PLATFORM_PROFILE_PATH = "/sys/firmware/acpi/platform_profile"
+PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
+
+# pwm1_enable semantics for this hardware (verified live):
+#   "0" -> MAX (full speed)
+#   "2" -> AUTO (firmware curve)
+# Writing "1" is rejected by the driver; we never use it.
+PWM_MAX = "0"
+PWM_AUTO = "2"
+
+NVIDIA_VENDOR = "0x10de"
+NVIDIA_SMI_TIMEOUT_SEC = 2
+
+# ----------------------------------------------------------------------------
+# Default configuration (single source of truth mirrored in config.default.json)
+# ----------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "poll_interval_sec": 2,
+    "low_battery_pct": 20,
+    "override": "policy",  # "policy" | "max" | "auto"
+    "profile_map": {
+        "performance": "performance",
+        "balanced": "balanced",
+        "quiet": "power-saver",
+        "cool": "power-saver",
+        "low-power": "power-saver",
+    },
+    "profiles": {
+        "performance": {"always_max": True},
+        "balanced": {
+            "cpu_on": 85, "cpu_off": 75,
+            "igpu_on": 70, "igpu_off": 60,
+            "dgpu_on": 72, "dgpu_off": 62,
+        },
+        "power-saver": {
+            "cpu_on": 90, "cpu_off": 80,
+            "igpu_on": 78, "igpu_off": 68,
+            "dgpu_on": 80, "dgpu_off": 70,
+        },
+    },
+}
+
+
+# ----------------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------------
+def log(msg):
+    """Log to stderr (captured by systemd journal)."""
+    sys.stderr.write("victus-fand: " + msg + "\n")
+    sys.stderr.flush()
+
+
+def read_text(path):
+    """Read a sysfs/text file, returning stripped contents or None on error."""
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except (OSError, IOError):
+        return None
+
+
+def read_int(path):
+    """Read an integer from a sysfs file, returning None on error."""
+    val = read_text(path)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        # Some sysfs files may have trailing junk; try the first token.
+        try:
+            return int(val.split()[0])
+        except (ValueError, IndexError):
+            return None
+
+
+def listdir(path):
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def atomic_write(path, data, mode=0o644):
+    """
+    Atomically write `data` (str) to `path` by writing a temp file in the SAME
+    directory and os.replace()-ing it into place.
+    """
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(directory, ".%s.tmp.%d" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ----------------------------------------------------------------------------
+# Discovery — all paths discovered dynamically, cached, and re-validated.
+# ----------------------------------------------------------------------------
+def find_hp_wmi_hwmon():
+    """
+    Find the hp-wmi hwmon directory that exposes pwm1_enable + fan1_input.
+    Returns the hwmon directory path, or None.
+    """
+    base = HP_WMI_HWMON_GLOB_ROOT
+    for name in sorted(listdir(base)):
+        if not name.startswith("hwmon"):
+            continue
+        d = os.path.join(base, name)
+        if os.path.exists(os.path.join(d, "pwm1_enable")):
+            return d
+    return None
+
+
+def find_hwmon_by_name(names):
+    """
+    Scan /sys/class/hwmon/* for a device whose `name` file matches one of
+    `names` (in priority order). Returns the hwmon dir path, or None.
+    `names` is a list to allow fallbacks (e.g. k10temp -> coretemp -> zenpower).
+    """
+    # Build a map name->dir first so we can honor caller priority order.
+    found = {}
+    for entry in sorted(listdir(HWMON_CLASS_ROOT)):
+        d = os.path.join(HWMON_CLASS_ROOT, entry)
+        nm = read_text(os.path.join(d, "name"))
+        if nm is not None and nm not in found:
+            found[nm] = d
+    for want in names:
+        if want in found:
+            return found[want]
+    return None
+
+
+def find_nvidia_pci_device():
+    """
+    Locate the NVIDIA dGPU PCI device (vendor 0x10de, class starts 0x0300).
+    Returns the sysfs device dir, or None.
+    """
+    for entry in sorted(listdir(PCI_DEVICES_ROOT)):
+        d = os.path.join(PCI_DEVICES_ROOT, entry)
+        vendor = read_text(os.path.join(d, "vendor"))
+        klass = read_text(os.path.join(d, "class"))
+        if vendor is None or klass is None:
+            continue
+        if vendor.lower() == NVIDIA_VENDOR and klass.lower().startswith("0x0300"):
+            return d
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Sensor / fan / battery / profile readers
+# ----------------------------------------------------------------------------
+def milli_to_c(milli):
+    if milli is None:
+        return None
+    return round(milli / 1000.0, 1)
+
+
+def read_cpu_temp(cpu_hwmon):
+    if not cpu_hwmon:
+        return None
+    return milli_to_c(read_int(os.path.join(cpu_hwmon, "temp1_input")))
+
+
+def read_igpu_temp(igpu_hwmon):
+    if not igpu_hwmon:
+        return None
+    return milli_to_c(read_int(os.path.join(igpu_hwmon, "temp1_input")))
+
+
+def nvidia_runtime_status(nvidia_dev):
+    """
+    Return the runtime power status string for the NVIDIA device
+    (e.g. "active", "suspended", "suspending"), or None if unknown.
+    """
+    if not nvidia_dev:
+        return None
+    status = read_text(os.path.join(nvidia_dev, "power", "runtime_status"))
+    return status
+
+
+def read_dgpu(nvidia_dev):
+    """
+    Read dGPU temperature WITHOUT waking it.
+
+    Returns (temp_c_or_None, state_str). state_str is one of:
+      "active"     -> GPU awake; temp populated if nvidia-smi succeeded
+      "suspended"  -> GPU asleep; we deliberately did NOT call nvidia-smi
+      "unknown"    -> could not determine (no device / no runtime status)
+    """
+    status = nvidia_runtime_status(nvidia_dev)
+
+    if status is None:
+        # No NVIDIA device or no runtime power info — treat as unknown/absent.
+        return None, "unknown"
+
+    if status != "active":
+        # Suspended/suspending/etc. Do NOT call nvidia-smi (would wake it).
+        return None, "suspended"
+
+    # Device is active: safe to query nvidia-smi (guarded for missing/timeout).
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=NVIDIA_SMI_TIMEOUT_SEC,
+        )
+    except FileNotFoundError:
+        # nvidia-smi not installed.
+        return None, "active"
+    except subprocess.TimeoutExpired:
+        return None, "active"
+    except Exception as exc:  # noqa: BLE001 - never let this crash the loop
+        log("nvidia-smi error: %s" % exc)
+        return None, "active"
+
+    if out.returncode != 0:
+        return None, "active"
+
+    line = out.stdout.strip().splitlines()
+    if not line:
+        return None, "active"
+    first = line[0].strip()
+    parts = [p.strip() for p in first.split(",")]
+    try:
+        temp = float(parts[0])
+    except (ValueError, IndexError):
+        return None, "active"
+    return round(temp, 1), "active"
+
+
+def read_fan(hp_hwmon):
+    """Return (rpm1, rpm2, pwm_enable_int)."""
+    rpm1 = read_int(os.path.join(hp_hwmon, "fan1_input")) if hp_hwmon else None
+    rpm2 = read_int(os.path.join(hp_hwmon, "fan2_input")) if hp_hwmon else None
+    pwm = read_int(os.path.join(hp_hwmon, "pwm1_enable")) if hp_hwmon else None
+    return rpm1, rpm2, pwm
+
+
+def read_battery_and_ac():
+    """
+    Scan /sys/class/power_supply/*.
+    Returns (on_battery: bool, battery_pct: int|None).
+
+    on_battery is True when a Mains supply reports online==0, OR (if no Mains
+    found) when a Battery reports status "Discharging".
+    """
+    battery_pct = None
+    battery_status = None
+    mains_online = None
+
+    for entry in sorted(listdir(POWER_SUPPLY_ROOT)):
+        d = os.path.join(POWER_SUPPLY_ROOT, entry)
+        ps_type = read_text(os.path.join(d, "type"))
+        if ps_type == "Battery":
+            cap = read_int(os.path.join(d, "capacity"))
+            if cap is not None and battery_pct is None:
+                battery_pct = cap
+            st = read_text(os.path.join(d, "status"))
+            if st is not None and battery_status is None:
+                battery_status = st
+        elif ps_type == "Mains":
+            online = read_int(os.path.join(d, "online"))
+            if online is not None:
+                # If any mains is online, we are not on battery.
+                if mains_online is None:
+                    mains_online = online
+                elif online == 1:
+                    mains_online = 1
+
+    if mains_online is not None:
+        on_battery = (mains_online == 0)
+    elif battery_status is not None:
+        on_battery = (battery_status.lower() == "discharging")
+    else:
+        on_battery = False
+
+    return on_battery, battery_pct
+
+
+def read_platform_profile():
+    """Return the current platform_profile (e.g. 'performance'), or None."""
+    return read_text(PLATFORM_PROFILE_PATH)
+
+
+# ----------------------------------------------------------------------------
+# Config handling
+# ----------------------------------------------------------------------------
+def deep_merge(base, override):
+    """Recursively merge `override` onto a copy of `base` and return it."""
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config():
+    """
+    Load config.json merged over DEFAULT_CONFIG.
+    On any failure, return a copy of DEFAULT_CONFIG.
+    """
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            user_cfg = json.load(f)
+        if not isinstance(user_cfg, dict):
+            raise ValueError("config root is not an object")
+        return deep_merge(DEFAULT_CONFIG, user_cfg)
+    except FileNotFoundError:
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    except Exception as exc:  # noqa: BLE001
+        log("config load failed (%s); using defaults" % exc)
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+def reset_override_on_startup():
+    """
+    On startup, force config.override back to "policy" so a forced MAX/AUTO
+    state never persists across reboots. Only rewrites the file if it actually
+    needs changing, and preserves all other keys. Written atomically.
+    """
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        # No config file yet — nothing to reset; daemon will use defaults.
+        return
+    except Exception as exc:  # noqa: BLE001
+        log("startup override reset: cannot read config (%s); skipping" % exc)
+        return
+
+    if not isinstance(raw, dict):
+        return
+
+    if raw.get("override", "policy") == "policy":
+        return  # already clean
+
+    raw["override"] = "policy"
+    try:
+        atomic_write(CONFIG_PATH, json.dumps(raw, indent=2) + "\n", mode=0o664)
+        log("startup: reset override -> policy")
+    except Exception as exc:  # noqa: BLE001
+        log("startup override reset failed: %s" % exc)
+
+
+# ----------------------------------------------------------------------------
+# Decision logic
+# ----------------------------------------------------------------------------
+def compute_hysteresis(profile_name, thresholds, temps, prev_state):
+    """
+    Apply hysteresis over present sensors.
+
+    Present sensors: cpu always (if not None); igpu if not None; dgpu only if
+    not None. For each present sensor we use <sensor>_on / <sensor>_off.
+
+    Rules:
+      * If ANY present sensor >= its _on threshold  -> MAX.
+      * elif prev_state == MAX and ALL present sensors <= their _off  -> AUTO.
+      * else keep prev_state.
+
+    Returns (desired_pwm, reason).
+    """
+    present = []  # list of (label, value, on_thr, off_thr)
+    for label in ("cpu", "igpu", "dgpu"):
+        val = temps.get(label)
+        if val is None:
+            continue
+        on_thr = thresholds.get(label + "_on")
+        off_thr = thresholds.get(label + "_off")
+        if on_thr is None or off_thr is None:
+            continue
+        present.append((label, val, on_thr, off_thr))
+
+    if not present:
+        # No usable sensors — be safe and keep previous state.
+        reason = "%s: no sensors -> keep %s" % (
+            profile_name,
+            "MAX" if prev_state == PWM_MAX else "AUTO",
+        )
+        return prev_state, reason
+
+    # Any sensor at/over its ON threshold => MAX.
+    for label, val, on_thr, off_thr in present:
+        if val >= on_thr:
+            reason = "%s: %s %g>=%g -> MAX" % (profile_name, label, val, on_thr)
+            return PWM_MAX, reason
+
+    # Currently MAX: only drop to AUTO when ALL present sensors are at/below OFF.
+    if prev_state == PWM_MAX:
+        all_cool = all(val <= off_thr for _, val, _, off_thr in present)
+        if all_cool:
+            reason = "%s: all cool -> AUTO" % profile_name
+            return PWM_AUTO, reason
+        # Still in the hysteresis band -> stay MAX.
+        hot = [
+            "%s %g>%g" % (label, val, off_thr)
+            for label, val, _, off_thr in present
+            if val > off_thr
+        ]
+        reason = "%s: hysteresis hold MAX (%s)" % (profile_name, ", ".join(hot))
+        return PWM_MAX, reason
+
+    # Currently AUTO and nothing over ON -> stay AUTO.
+    reason = "%s: below thresholds -> AUTO" % profile_name
+    return PWM_AUTO, reason
+
+
+def decide(config, temps, on_battery, battery_pct, platform_profile, prev_state):
+    """
+    Run the full decision logic.
+    Returns (desired_pwm, reason, policy, effective_policy).
+    """
+    enabled = bool(config.get("enabled", True))
+    if not enabled:
+        return PWM_AUTO, "disabled", "disabled", "disabled"
+
+    override = config.get("override", "policy")
+    profile_map = config.get("profile_map", {})
+    low_battery_pct = config.get("low_battery_pct", 20)
+
+    # policy is derived from platform_profile even when overridden, so status
+    # can still report it; effective is what we'd act on under policy.
+    policy = profile_map.get(platform_profile, "balanced")
+    low_batt_active = (
+        on_battery and battery_pct is not None and battery_pct <= low_battery_pct
+    )
+    effective = "power-saver" if low_batt_active else policy
+
+    if override == "max":
+        return PWM_MAX, "override: forced MAX", policy, effective
+    if override == "auto":
+        return PWM_AUTO, "override: forced AUTO", policy, effective
+
+    # override == "policy" (or anything unrecognized) -> compute policy.
+    if effective == "performance":
+        return PWM_MAX, "performance: forced MAX", policy, effective
+
+    profiles = config.get("profiles", {})
+    thresholds = profiles.get(effective)
+    if not isinstance(thresholds, dict):
+        # Unknown profile or malformed -> fall back to balanced defaults.
+        thresholds = DEFAULT_CONFIG["profiles"]["balanced"]
+
+    if thresholds.get("always_max"):
+        return PWM_MAX, "%s: always_max -> MAX" % effective, policy, effective
+
+    desired, reason = compute_hysteresis(effective, thresholds, temps, prev_state)
+    return desired, reason, policy, effective
+
+
+# ----------------------------------------------------------------------------
+# Daemon
+# ----------------------------------------------------------------------------
+class Daemon:
+    def __init__(self):
+        self.running = True
+        # Cached discovered paths (re-discovered if they vanish).
+        self.hp_hwmon = None
+        self.cpu_hwmon = None
+        self.igpu_hwmon = None
+        self.nvidia_dev = None
+        # Persistent hysteresis state across loop iterations. Initial = AUTO.
+        self.prev_state = PWM_AUTO
+
+    # --- path (re)discovery -------------------------------------------------
+    def ensure_paths(self):
+        """(Re)discover any cached path that is missing/stale."""
+        if not self.hp_hwmon or not os.path.exists(
+            os.path.join(self.hp_hwmon, "pwm1_enable")
+        ):
+            self.hp_hwmon = find_hp_wmi_hwmon()
+
+        if not self.cpu_hwmon or not os.path.exists(
+            os.path.join(self.cpu_hwmon, "temp1_input")
+        ):
+            self.cpu_hwmon = find_hwmon_by_name(["k10temp", "coretemp", "zenpower"])
+
+        if not self.igpu_hwmon or not os.path.exists(
+            os.path.join(self.igpu_hwmon, "temp1_input")
+        ):
+            self.igpu_hwmon = find_hwmon_by_name(["amdgpu"])
+
+        if not self.nvidia_dev or not os.path.exists(self.nvidia_dev):
+            self.nvidia_dev = find_nvidia_pci_device()
+
+    # --- fan control --------------------------------------------------------
+    def read_current_pwm(self):
+        if not self.hp_hwmon:
+            return None
+        val = read_text(os.path.join(self.hp_hwmon, "pwm1_enable"))
+        return val
+
+    def write_pwm(self, value):
+        """
+        Write `value` ("0" or "2") to pwm1_enable. Returns True on success.
+        Logs and returns False on error (never raises).
+        """
+        if not self.hp_hwmon:
+            log("cannot write pwm: hp-wmi hwmon not found")
+            return False
+        path = os.path.join(self.hp_hwmon, "pwm1_enable")
+        try:
+            with open(path, "w") as f:
+                f.write(value)
+            return True
+        except OSError as exc:
+            log("pwm write failed (%s -> %s): %s" % (value, path, exc))
+            return False
+
+    def apply_desired(self, desired):
+        """Write desired pwm only if different from current. Returns applied state."""
+        current = self.read_current_pwm()
+        if current == desired:
+            return desired
+        ok = self.write_pwm(desired)
+        if ok:
+            return desired
+        # Write failed: report whatever the hardware currently is.
+        return current if current is not None else desired
+
+    # --- one loop iteration -------------------------------------------------
+    def step(self):
+        self.ensure_paths()
+        config = load_config()
+
+        # Gather sensors.
+        cpu = read_cpu_temp(self.cpu_hwmon)
+        igpu = read_igpu_temp(self.igpu_hwmon)
+        dgpu, dgpu_state = read_dgpu(self.nvidia_dev)
+        temps = {"cpu": cpu, "igpu": igpu, "dgpu": dgpu}
+
+        on_battery, battery_pct = read_battery_and_ac()
+        platform_profile = read_platform_profile()
+
+        desired, reason, policy, effective = decide(
+            config, temps, on_battery, battery_pct, platform_profile, self.prev_state
+        )
+
+        applied = self.apply_desired(desired)
+        # Persist the state we actually acted on for hysteresis continuity.
+        # We track the *desired* logical state so hysteresis is stable even if a
+        # single write transiently fails.
+        self.prev_state = desired
+
+        rpm1, rpm2, pwm_enable = read_fan(self.hp_hwmon)
+        # Prefer the freshly-read hardware pwm for reporting; fall back to applied.
+        eff_pwm = pwm_enable
+        if eff_pwm is None:
+            try:
+                eff_pwm = int(applied)
+            except (ValueError, TypeError):
+                eff_pwm = None
+        fan_state = "MAX" if eff_pwm == 0 else ("AUTO" if eff_pwm == 2 else "?")
+
+        low_batt_active = (
+            on_battery
+            and battery_pct is not None
+            and battery_pct <= config.get("low_battery_pct", 20)
+        )
+
+        status = {
+            "ts": round(time.time(), 3),
+            "daemon_version": DAEMON_VERSION,
+            "enabled": bool(config.get("enabled", True)),
+            "power_profile_raw": platform_profile,
+            "policy": policy,
+            "effective_policy": effective,
+            "on_battery": bool(on_battery),
+            "battery_pct": battery_pct,
+            "low_battery_active": bool(low_batt_active),
+            "override": config.get("override", "policy"),
+            "temps": {
+                "cpu": cpu,
+                "igpu": igpu,
+                "dgpu": dgpu,
+                "dgpu_state": dgpu_state,
+            },
+            "fan": {
+                "rpm1": rpm1,
+                "rpm2": rpm2,
+                "pwm_enable": eff_pwm,
+                "state": fan_state,
+            },
+            "decision_reason": reason,
+        }
+
+        try:
+            atomic_write(STATUS_PATH, json.dumps(status) + "\n", mode=0o644)
+        except Exception as exc:  # noqa: BLE001
+            log("status write failed: %s" % exc)
+
+    # --- main loop ----------------------------------------------------------
+    def run(self):
+        log("starting (version %s)" % DAEMON_VERSION)
+        reset_override_on_startup()
+
+        # Discover up-front (loop will re-discover if anything moves).
+        self.ensure_paths()
+        if not self.hp_hwmon:
+            log("WARNING: hp-wmi hwmon not found at startup; will keep retrying")
+
+        while self.running:
+            loop_start = time.time()
+            try:
+                self.step()
+            except Exception as exc:  # noqa: BLE001 - daemon must never die here
+                log("loop error (continuing): %s" % exc)
+
+            # Poll interval is read fresh each loop from config (clamped sane).
+            try:
+                interval = float(load_config().get("poll_interval_sec", 2))
+            except Exception:  # noqa: BLE001
+                interval = 2.0
+            if interval < 0.5:
+                interval = 0.5
+            if interval > 60:
+                interval = 60.0
+
+            # Sleep the remainder of the interval, responsive to shutdown.
+            elapsed = time.time() - loop_start
+            remaining = interval - elapsed
+            while remaining > 0 and self.running:
+                time.sleep(min(remaining, 0.5))
+                remaining = interval - (time.time() - loop_start)
+
+        self.shutdown()
+
+    def shutdown(self):
+        """Hand fans back to firmware (AUTO) and exit cleanly."""
+        log("shutting down; restoring AUTO (pwm1_enable=2)")
+        # Make sure we have a path even if discovery never ran.
+        if not self.hp_hwmon:
+            self.hp_hwmon = find_hp_wmi_hwmon()
+        if self.hp_hwmon:
+            try:
+                with open(os.path.join(self.hp_hwmon, "pwm1_enable"), "w") as f:
+                    f.write(PWM_AUTO)
+            except OSError as exc:
+                log("failed to restore AUTO on exit: %s" % exc)
+        else:
+            log("no hp-wmi hwmon found; cannot restore AUTO")
+
+    def handle_signal(self, signum, _frame):
+        log("received signal %d" % signum)
+        self.running = False
+
+
+def main():
+    if os.geteuid() != 0:
+        log("must run as root (need to write sysfs pwm + /run)")
+        # Exit non-zero so systemd shows a clear failure.
+        return 1
+
+    daemon = Daemon()
+    signal.signal(signal.SIGTERM, daemon.handle_signal)
+    signal.signal(signal.SIGINT, daemon.handle_signal)
+    try:
+        daemon.run()
+    except Exception as exc:  # noqa: BLE001
+        # Absolute last resort: still try to restore AUTO before dying.
+        log("fatal: %s" % exc)
+        try:
+            daemon.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
