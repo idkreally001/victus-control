@@ -573,6 +573,12 @@ static int rpm_for_level_for_fan(int level, size_t fan_index)
     if (kBetterAutoSteps <= 1) {
         return max_rpm;
     }
+    // If the fan's reported maximum is at or below our quiet floor there is
+    // nothing to interpolate, and the std::clamp(rpm, min, max) below would be
+    // undefined behaviour with min > max. Return the hardware maximum.
+    if (max_rpm <= kBetterAutoMinRpm) {
+        return max_rpm;
+    }
 
     double step = static_cast<double>(max_rpm - kBetterAutoMinRpm) / static_cast<double>(kBetterAutoSteps - 1);
     double value = static_cast<double>(kBetterAutoMinRpm) + static_cast<double>(level - 1) * step;

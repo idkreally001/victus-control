@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <sys/stat.h>
@@ -32,7 +33,11 @@ constexpr const char *kSudoPath = "/usr/bin/sudo";
 
 // Colors stashed when a four-zone keyboard is toggled off, so it can be
 // restored on toggle-on. Empty until the first off with lit zones.
+// Guarded by g_fourzone_mutex: each client is served on its own detached
+// thread, so concurrent SET_KBD_BRIGHTNESS calls would otherwise race on this
+// global (and interleave the per-zone hardware writes).
 std::optional<std::array<std::string, kFourZoneCount>> g_fourzone_saved_colors;
+std::mutex g_fourzone_mutex;
 
 bool omen_4zone_exists() {
   struct stat buffer;
@@ -289,6 +294,10 @@ std::string set_keyboard_brightness(const std::string &value) {
   // by per-zone RGB. Emulate the on/off toggle: brightness 0 stashes the
   // current colors and blacks every zone; a non-zero value restores them.
   if (omen_4zone_exists()) {
+    // Serialize the whole four-zone path: it reads/writes g_fourzone_saved_colors
+    // and issues per-zone hardware writes that must not interleave with a
+    // concurrent toggle from another client thread.
+    std::lock_guard<std::mutex> lock(g_fourzone_mutex);
     if (brightness_value == 0) {
       std::array<std::string, kFourZoneCount> stashed;
       for (int zone = 0; zone < kFourZoneCount; zone++) {
