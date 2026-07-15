@@ -686,8 +686,12 @@ class Daemon:
     def shutdown(self):
         """Hand fans back to firmware (AUTO) and exit cleanly."""
         log("shutting down; restoring AUTO (pwm1_enable=2)")
-        # Make sure we have a path even if discovery never ran.
-        if not self.hp_hwmon:
+        # Make sure we have a *valid* path: re-discover if discovery never ran
+        # or if the cached hwmon renumbered (e.g. after a module reload) and the
+        # old pwm1_enable no longer exists -- otherwise we'd write to a dead path
+        # and leave the fans forced.
+        if not self.hp_hwmon or not os.path.exists(
+                os.path.join(self.hp_hwmon, "pwm1_enable")):
             self.hp_hwmon = find_hp_wmi_hwmon()
         if self.hp_hwmon:
             try:

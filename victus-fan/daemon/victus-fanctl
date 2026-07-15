@@ -252,6 +252,22 @@ def cmd_set(args):
         err("error: value must be an integer, got %r" % raw_val)
         return 2
 
+    # Reject a threshold pair where on <= off: compute_hysteresis would then
+    # flip MAX->AUTO->MAX every poll, hammering the fans. Validate against the
+    # effective (on-disk merged over defaults) value of the paired key.
+    if key.endswith("_on") or key.endswith("_off"):
+        prefix = key.rsplit("_", 1)[0]
+        on_key, off_key = prefix + "_on", prefix + "_off"
+        eff_prof = load_effective_config().get("profiles", {}).get(profile, {})
+        on_val = value if key == on_key else eff_prof.get(on_key)
+        off_val = value if key == off_key else eff_prof.get(off_key)
+        if (isinstance(on_val, (int, float))
+                and isinstance(off_val, (int, float))
+                and on_val <= off_val):
+            err("error: %s (%s) must be greater than %s (%s); on<=off makes the "
+                "fans oscillate every poll" % (on_key, on_val, off_key, off_val))
+            return 2
+
     def m(cfg):
         profiles = cfg.get("profiles")
         if not isinstance(profiles, dict):
