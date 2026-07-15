@@ -19,7 +19,6 @@ Design goals:
 Pure python3 stdlib only.
 """
 
-import errno
 import json
 import os
 import signal

@@ -16,7 +16,6 @@ No root, no sudo, no desktop-specific assumptions beyond a running notification
 daemon (KDE, GNOME, etc. all provide one).
 """
 
-import os
 import shutil
 import socket
 import struct

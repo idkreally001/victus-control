@@ -3,6 +3,9 @@ Description=Victus Fan Controller (userspace hp-wmi two-state fan daemon)
 Documentation=file:///usr/share/doc/victus-fan/README.md
 # Start once the system is fully up; hp-wmi/hwmon is available well before this.
 After=multi-user.target
+# The DKMS-based victus-backend drives the same pwm1_enable knob; never let both
+# run at once (they would fight over the fans). Enabling one stops the other.
+Conflicts=victus-backend.service
 
 [Service]
 Type=simple

@@ -2,6 +2,9 @@
 Description=Victus Control Backend Service
 After=systemd-modules-load.service victus-healthcheck.service network.target
 Wants=victus-healthcheck.service
+# The userspace victus-fan daemon drives the same pwm1_enable knob; never let
+# both run at once (they would fight over the fans). Enabling one stops the other.
+Conflicts=victus-fan.service
 
 [Service]
 ExecStart=/usr/bin/victus-backend
