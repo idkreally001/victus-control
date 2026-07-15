@@ -38,6 +38,24 @@ warn_if_keyboard_interface_missing() {
     fi
 }
 
+resolve_hp_wmi_module_path() {
+    modprobe --show-depends hp_wmi 2>/dev/null \
+        | awk '$1 == "insmod" && $2 ~ /\/hp-wmi\.ko($|\.(gz|xz|zst)$)/ { print $2 }' \
+        | tail -n 1
+}
+
+hp_wmi_module_path_is_dkms() {
+    local module_path="${1:-}"
+
+    case "${module_path}" in
+        */extra/hp-wmi.ko|*/extra/hp-wmi.ko.*|*/updates/hp-wmi.ko|*/updates/hp-wmi.ko.*|*/updates/dkms/hp-wmi.ko|*/updates/dkms/hp-wmi.ko.*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
 if ! command -v dkms >/dev/null 2>&1; then
     echo "$log_prefix dkms command not found; skipping kernel module verification" >&2
     exit 0
@@ -59,10 +77,16 @@ else
     fi
 fi
 
-# DKMS installs the built module under /updates/dkms (Arch) or /extra (some
-# distros); accept either rather than pinning to one layout.
-if ! modprobe --show-depends hp_wmi | grep -Eq '/(updates/dkms|extra)/hp-wmi\.ko'; then
-    echo "$log_prefix warning: modprobe hp_wmi is not resolving to the DKMS-installed module" >&2
+# DKMS installs the built module under /updates/dkms (Arch), /extra, or
+# /updates (some distros); the helpers below accept any of those layouts,
+# including compressed .ko variants, rather than pinning to one path.
+module_path="$(resolve_hp_wmi_module_path || true)"
+if ! hp_wmi_module_path_is_dkms "${module_path}"; then
+    if [[ -n "${module_path}" ]]; then
+        echo "$log_prefix warning: modprobe hp_wmi resolved to an unexpected module path: ${module_path}" >&2
+    else
+        echo "$log_prefix warning: unable to determine which hp_wmi module modprobe would load" >&2
+    fi
 fi
 
 if ! lsmod | grep -q '^hp_wmi' || ! hp_wmi_fan_interface_ready; then

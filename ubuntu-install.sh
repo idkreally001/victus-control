@@ -11,33 +11,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}"
 
 module_name="hp-wmi-fan-and-backlight-control"
-# Populated from the cloned module's dkms.conf so a version bump upstream
-# never leaves this installer pinned to a stale number.
-module_version=""
-
-read_module_version_from_dkms_conf() {
-    local conf="$1"
-    [[ -r "${conf}" ]] || return 1
-    local version
-    version="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'\'']*\([^"'\'' ]*\).*/\1/p' "${conf}" | head -n 1)"
-    [[ -n "${version}" ]] || return 1
-    printf '%s' "${version}"
-}
+module_version="0.0.2"
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
-
     hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' | head -n 1 || true)"
     if [[ -z "${hwmon_path}" ]]; then
         echo "Error: hp_wmi hwmon directory not found." >&2
         return 1
     fi
-
     if [[ ! -e "${hwmon_path}/fan1_target" || ! -e "${hwmon_path}/fan2_target" ]]; then
         echo "Error: Patched hp_wmi fan target controls are missing under ${hwmon_path}." >&2
         return 1
     fi
-
     return 0
 }
 
@@ -97,30 +83,23 @@ reload_patched_hp_wmi() {
     done
 
     warn_if_keyboard_interface_missing
-
     return 0
 }
 
-install_fedora_dependencies() {
+install_ubuntu_dependencies() {
     local current_kernel
-    local packages=(
-        meson
-        ninja-build
-        gtk4-devel
-        git
-        dkms
-        gcc-c++
-        policycoreutils-python-utils
-        sudo
-    )
-
-    dnf install -y "${packages[@]}"
-
     current_kernel="$(uname -r)"
-    if ! dnf install -y "kernel-devel-${current_kernel}"; then
-        echo "Warning: Could not install kernel-devel-${current_kernel}; falling back to kernel-devel." >&2
-        dnf install -y kernel-devel
-    fi
+
+    apt-get update -q
+    apt-get install -y \
+        meson \
+        ninja-build \
+        libgtk-4-dev \
+        git \
+        dkms \
+        g++ \
+        sudo \
+        "linux-headers-${current_kernel}"
 }
 
 ensure_users_and_groups() {
@@ -170,33 +149,6 @@ install_helpers_and_sudoers() {
     fi
 }
 
-install_temperature_monitor() {
-    echo "--> Installing temperature monitor (per-user notifications)..."
-    install -m 0755 monitor/victus-monitor.py /usr/bin/victus-monitor
-    install -D -m 0644 monitor/victus-monitor.service \
-        /usr/lib/systemd/user/victus-monitor.service
-    systemctl daemon-reload
-
-    # The monitor runs in the desktop user's session (needs their D-Bus for
-    # notifications), so enable it for the invoking user, not root.
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        local uid
-        uid="$(id -u "${SUDO_USER}")"
-        if sudo -u "${SUDO_USER}" \
-               XDG_RUNTIME_DIR="/run/user/${uid}" \
-               systemctl --user enable --now victus-monitor.service 2>/dev/null; then
-            echo "Enabled victus-monitor.service for user '${SUDO_USER}'."
-        else
-            echo "Note: could not enable victus-monitor for '${SUDO_USER}' now" \
-                 "(no active session?). It will start on next login."
-        fi
-    else
-        echo "Note: run the installer with sudo from your desktop user to" \
-             "auto-enable the temperature monitor. Otherwise enable it with:" \
-             "systemctl --user enable --now victus-monitor.service"
-    fi
-}
-
 install_hp_wmi_dkms() {
     local wmi_root="wmi-project"
     local wmi_repo="${wmi_root}/hp-wmi-fan-and-backlight-control"
@@ -213,12 +165,6 @@ install_hp_wmi_dkms() {
     fi
 
     pushd "${wmi_repo}" >/dev/null
-
-    module_version="$(read_module_version_from_dkms_conf dkms.conf)" || {
-        echo "Error: could not read PACKAGE_VERSION from dkms.conf." >&2
-        exit 1
-    }
-    echo "Detected hp-wmi module version ${module_version}."
 
     if dkms status -m "${module_name}" -v "${module_version}" >/dev/null 2>&1; then
         dkms remove "${module_name}/${module_version}" --all || true
@@ -248,15 +194,8 @@ build_and_install_app() {
     fi
 }
 
-install_fedora_udev_rules() {
-    echo "--> Installing Fedora-specific udev rules..."
-    install -m 0644 99-hp-wmi-permissions.rules /etc/udev/rules.d/99-hp-wmi-permissions.rules
-    rm -f /etc/udev/rules.d/victus-control.rules
-}
-
 start_services() {
     echo "--> Configuring and starting backend service..."
-
     systemd-tmpfiles --create || echo "Warning: Failed to create tmpfiles, continuing..."
     systemctl daemon-reload
     udevadm control --reload-rules
@@ -269,22 +208,14 @@ start_services() {
     systemctl is-active --quiet victus-backend.service
 }
 
-echo "--- Starting Victus Control Installation (Fedora) ---"
+echo "--- Starting Victus Control Installation (Ubuntu) ---"
 echo "--> Installing required packages..."
-install_fedora_dependencies
+install_ubuntu_dependencies
 ensure_users_and_groups
 install_helpers_and_sudoers
-install_temperature_monitor
 install_hp_wmi_dkms
 build_and_install_app
-install_fedora_udev_rules
 start_services
-
-if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
-    echo
-    echo "SELinux is enforcing. That configuration was validated for basic fan control on Fedora,"
-    echo "but if you see permission denials, check 'journalctl -t setroubleshoot' and 'ausearch -m avc'."
-fi
 
 echo
 echo "--- Installation Complete! ---"
