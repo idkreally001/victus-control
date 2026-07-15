@@ -6,6 +6,19 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <memory>
+
+namespace {
+// Carries the strings produced by the off-thread refresh back to the GTK main
+// thread, where the label writes must happen.
+struct FanLabelUpdate {
+    VictusFanControl *self;
+    std::string fan1;
+    std::string fan2;
+    std::string cpu;
+    std::string gpu;
+};
+} // namespace
 
 // Constants for manual fan control
 const int MIN_RPM = 2000;
@@ -114,35 +127,64 @@ void VictusFanControl::update_ui_from_system_state()
 
 void VictusFanControl::update_fan_speeds()
 {
-    auto response1 = socket_client->send_command_async(GET_FAN_SPEED, "1");
-    auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
-    auto response_temp = socket_client->send_command_async(GET_CPU_TEMP);
-    auto response_gpu_temp = socket_client->send_command_async(GET_GPU_TEMP);
-
-    std::string fan1_speed = response1.get();
-    if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
-
-    std::string fan2_speed = response2.get();
-    if (fan2_speed.find("ERROR") != std::string::npos) fan2_speed = "N/A";
-
-    std::string cpu_temp = response_temp.get();
-    if (cpu_temp.find("ERROR") != std::string::npos) cpu_temp = "N/A";
-
-    // GPU: "IDLE" means the dGPU is runtime-suspended (no reading, not an error).
-    std::string gpu_temp = response_gpu_temp.get();
-    std::string gpu_temp_text;
-    if (gpu_temp == "IDLE") {
-        gpu_temp_text = "GPU Temp: idle";
-    } else if (gpu_temp.find("ERROR") != std::string::npos) {
-        gpu_temp_text = "GPU Temp: N/A °C";
-    } else {
-        gpu_temp_text = "GPU Temp: " + gpu_temp + " °C";
+    // The socket client serialises every call on one connection, and
+    // GET_GPU_TEMP makes the backend run `timeout 3 nvidia-smi` when the dGPU is
+    // awake. Doing the blocking .get()s on the GTK main thread (this is called
+    // from a 2 s g_timeout) freezes the UI for up to ~3 s per tick. So run the
+    // round-trips on a worker thread and marshal the label writes back to the
+    // main thread with g_idle_add. Skip if a prior refresh is still running so
+    // slow ticks don't pile up overlapping workers.
+    bool expected = false;
+    if (!refresh_in_flight.compare_exchange_strong(expected, true)) {
+        return;
     }
 
-    gtk_label_set_text(GTK_LABEL(fan1_speed_label), ("Fan 1 Speed: " + fan1_speed + " RPM").c_str());
-    gtk_label_set_text(GTK_LABEL(fan2_speed_label), ("Fan 2 Speed: " + fan2_speed + " RPM").c_str());
-    gtk_label_set_text(GTK_LABEL(cpu_temp_label), ("CPU Temp: " + cpu_temp + " °C").c_str());
-    gtk_label_set_text(GTK_LABEL(gpu_temp_label), gpu_temp_text.c_str());
+    std::thread([this]() {
+        auto response1 = socket_client->send_command_async(GET_FAN_SPEED, "1");
+        auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
+        auto response_temp = socket_client->send_command_async(GET_CPU_TEMP);
+        auto response_gpu_temp = socket_client->send_command_async(GET_GPU_TEMP);
+
+        std::string fan1_speed = response1.get();
+        if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
+
+        std::string fan2_speed = response2.get();
+        if (fan2_speed.find("ERROR") != std::string::npos) fan2_speed = "N/A";
+
+        std::string cpu_temp = response_temp.get();
+        if (cpu_temp.find("ERROR") != std::string::npos) cpu_temp = "N/A";
+
+        // GPU: "IDLE" means the dGPU is runtime-suspended (no reading, not an error).
+        std::string gpu_temp = response_gpu_temp.get();
+        std::string gpu_temp_text;
+        if (gpu_temp == "IDLE") {
+            gpu_temp_text = "GPU Temp: idle";
+        } else if (gpu_temp.find("ERROR") != std::string::npos) {
+            gpu_temp_text = "GPU Temp: N/A °C";
+        } else {
+            gpu_temp_text = "GPU Temp: " + gpu_temp + " °C";
+        }
+
+        auto *payload = new FanLabelUpdate{
+            this,
+            "Fan 1 Speed: " + fan1_speed + " RPM",
+            "Fan 2 Speed: " + fan2_speed + " RPM",
+            "CPU Temp: " + cpu_temp + " °C",
+            gpu_temp_text};
+
+        g_idle_add(
+            +[](gpointer data) -> gboolean {
+                std::unique_ptr<FanLabelUpdate> u(static_cast<FanLabelUpdate *>(data));
+                VictusFanControl *self = u->self;
+                gtk_label_set_text(GTK_LABEL(self->fan1_speed_label), u->fan1.c_str());
+                gtk_label_set_text(GTK_LABEL(self->fan2_speed_label), u->fan2.c_str());
+                gtk_label_set_text(GTK_LABEL(self->cpu_temp_label), u->cpu.c_str());
+                gtk_label_set_text(GTK_LABEL(self->gpu_temp_label), u->gpu.c_str());
+                self->refresh_in_flight.store(false);
+                return G_SOURCE_REMOVE;
+            },
+            payload);
+    }).detach();
 }
 
 void VictusFanControl::set_fan_rpm(int level)

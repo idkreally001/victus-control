@@ -38,6 +38,9 @@ private:
 
 	std::shared_ptr<VictusSocketClient> socket_client;
     std::atomic<unsigned long long> manual_request_generation{0};
+    // Set while a periodic refresh worker is running so a slow backend call
+    // (GET_GPU_TEMP -> `timeout 3 nvidia-smi`) can't pile up overlapping workers.
+    std::atomic<bool> refresh_in_flight{false};
 };
 
 #endif // FAN_HPP
