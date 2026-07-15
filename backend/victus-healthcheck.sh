@@ -24,7 +24,7 @@ resolve_module_version() {
 hp_wmi_fan_interface_ready() {
     local hwmon_path
 
-    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' | head -n 1 || true)"
+    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' 2>/dev/null | sort -V | tail -n 1 || true)"
     [[ -n "${hwmon_path}" ]] || return 1
     [[ -e "${hwmon_path}/fan1_target" ]] || return 1
     [[ -e "${hwmon_path}/fan2_target" ]] || return 1

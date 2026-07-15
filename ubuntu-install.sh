@@ -26,7 +26,7 @@ read_module_version_from_dkms_conf() {
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
-    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' | head -n 1 || true)"
+    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' 2>/dev/null | sort -V | tail -n 1 || true)"
     if [[ -z "${hwmon_path}" ]]; then
         echo "Error: hp_wmi hwmon directory not found." >&2
         return 1
