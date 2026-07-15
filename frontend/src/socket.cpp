@@ -14,11 +14,13 @@ bool send_all(int socket, const void *buffer, size_t length) {
   const char *ptr = static_cast<const char *>(buffer);
   while (length > 0) {
     ssize_t bytes_sent = send(socket, ptr, length, 0);
-    if (bytes_sent < 1) {
+    if (bytes_sent < 0) {
+      if (errno == EINTR) continue;
       return false;
     }
+    if (bytes_sent == 0) return false;
     ptr += bytes_sent;
-    length -= bytes_sent;
+    length -= static_cast<size_t>(bytes_sent);
   }
   return true;
 }
@@ -27,11 +29,13 @@ bool read_all(int socket, void *buffer, size_t length) {
   char *ptr = static_cast<char *>(buffer);
   while (length > 0) {
     ssize_t bytes_read = recv(socket, ptr, length, 0);
-    if (bytes_read < 1) {
+    if (bytes_read < 0) {
+      if (errno == EINTR) continue;
       return false;
     }
+    if (bytes_read == 0) return false;
     ptr += bytes_read;
-    length -= bytes_read;
+    length -= static_cast<size_t>(bytes_read);
   }
   return true;
 }
@@ -76,6 +80,8 @@ VictusSocketClient::VictusSocketClient(const std::string &path) : socket_path(pa
       {GET_KBD_BRIGHTNESS, "GET_KBD_BRIGHTNESS"},
       {SET_KBD_BRIGHTNESS, "SET_KBD_BRIGHTNESS"},
       {GET_KEYBOARD_TYPE, "GET_KEYBOARD_TYPE"},
+      {GET_CPU_TEMP, "GET_CPU_TEMP"},
+      {GET_GPU_TEMP, "GET_GPU_TEMP"},
   };
 
   // Don't connect here, connect on first command

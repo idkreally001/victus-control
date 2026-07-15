@@ -26,18 +26,15 @@ read_module_version_from_dkms_conf() {
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
-
     hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' 2>/dev/null | sort -V | tail -n 1 || true)"
     if [[ -z "${hwmon_path}" ]]; then
         echo "Error: hp_wmi hwmon directory not found." >&2
         return 1
     fi
-
     if [[ ! -e "${hwmon_path}/fan1_target" || ! -e "${hwmon_path}/fan2_target" ]]; then
         echo "Error: Patched hp_wmi fan target controls are missing under ${hwmon_path}." >&2
         return 1
     fi
-
     return 0
 }
 
@@ -97,54 +94,41 @@ reload_patched_hp_wmi() {
     done
 
     warn_if_keyboard_interface_missing
-
     return 0
 }
 
-install_arch_dependencies() {
-    local packages=(meson ninja gtk4 git dkms sudo python libnotify)
-    declare -A header_packages=()
-    local module_dir=""
-    local pkgbase_path=""
-    local kernel_release=""
-    local kernel_pkg=""
-    local header_pkg=""
+install_ubuntu_dependencies() {
+    local current_kernel
+    current_kernel="$(uname -r)"
 
-    for module_dir in /usr/lib/modules/*; do
-        [[ -d "${module_dir}" ]] || continue
+    # Keep apt fully non-interactive: -y alone does not suppress needrestart's
+    # whiptail dialog on Ubuntu 24.04 (triggered by the kernel-headers install),
+    # which would otherwise hang an unattended `sudo ./install.sh`.
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
 
-        pkgbase_path="${module_dir}/pkgbase"
-        kernel_release="$(basename "${module_dir}")"
+    apt-get update -q
+    apt-get install -y \
+        meson \
+        ninja-build \
+        libgtk-4-dev \
+        pkg-config \
+        git \
+        dkms \
+        g++ \
+        sudo \
+        python3 \
+        libnotify-bin
 
-        if [[ -r "${pkgbase_path}" ]]; then
-            kernel_pkg="$(<"${pkgbase_path}")"
-            kernel_pkg="${kernel_pkg//[[:space:]]/}"
-            header_pkg="${kernel_pkg}-headers"
-
-            if pacman -Si "${header_pkg}" >/dev/null 2>&1; then
-                header_packages["${header_pkg}"]=1
-                echo "Detected kernel '${kernel_pkg}' (${kernel_release}); queued '${header_pkg}'."
-                continue
-            fi
-
-            echo "Warning: Unable to find package '${header_pkg}' for kernel '${kernel_pkg}' (${kernel_release})."
-        else
-            echo "Warning: Unable to read kernel package info at '${pkgbase_path}'."
-        fi
-
-        header_packages[linux-headers]=1
-    done
-
-    if [[ ${#header_packages[@]} -eq 0 ]]; then
-        echo "Warning: No kernel headers detected; defaulting to 'linux-headers'."
-        header_packages[linux-headers]=1
+    # The exact running-kernel headers are not always in the archive (kernel
+    # upgraded but not yet rebooted, or an HWE kernel), which would abort the
+    # whole install under `set -e`. Fall back to the generic meta-package.
+    if ! apt-get install -y "linux-headers-${current_kernel}"; then
+        echo "Warning: linux-headers-${current_kernel} unavailable; falling back to linux-headers-generic." >&2
+        echo "         If the DKMS build later fails, reboot into the kernel that matches the installed" >&2
+        echo "         headers and re-run this installer." >&2
+        apt-get install -y linux-headers-generic
     fi
-
-    for header_pkg in "${!header_packages[@]}"; do
-        packages+=("${header_pkg}")
-    done
-
-    pacman -S --needed --noconfirm "${packages[@]}"
 }
 
 ensure_users_and_groups() {
@@ -165,7 +149,7 @@ ensure_users_and_groups() {
     fi
 
     if ! id -u victus-backend >/dev/null 2>&1; then
-        useradd --system -g victus-backend -s /usr/bin/nologin victus-backend
+        useradd --system -g victus-backend -s /usr/sbin/nologin victus-backend
         echo "User 'victus-backend' created."
     else
         echo "User 'victus-backend' already exists."
@@ -224,10 +208,7 @@ install_temperature_monitor() {
 install_hp_wmi_dkms() {
     local wmi_root="wmi-project"
     local wmi_repo="${wmi_root}/hp-wmi-fan-and-backlight-control"
-    local module_dir=""
-    local kernel_release=""
-    local kernel_status=""
-    declare -a kernels_needing_install=()
+    local current_kernel
 
     echo "--> Installing patched hp-wmi kernel module..."
     mkdir -p "${wmi_root}"
@@ -252,24 +233,8 @@ install_hp_wmi_dkms() {
     fi
 
     dkms add .
-
-    for module_dir in /usr/lib/modules/*; do
-        [[ -d "${module_dir}" ]] || continue
-        kernel_release="$(basename "${module_dir}")"
-        kernel_status="$(dkms status -m "${module_name}" -v "${module_version}" -k "${kernel_release}" || true)"
-        if [[ "${kernel_status}" != *"installed"* ]]; then
-            kernels_needing_install+=("${kernel_release}")
-        fi
-    done
-
-    if [[ ${#kernels_needing_install[@]} -eq 0 ]]; then
-        echo "hp-wmi module is already installed via DKMS for all detected kernels."
-    else
-        echo "Installing hp-wmi module for kernels: ${kernels_needing_install[*]}"
-        for kernel_release in "${kernels_needing_install[@]}"; do
-            dkms install "${module_name}/${module_version}" -k "${kernel_release}"
-        done
-    fi
+    current_kernel="$(uname -r)"
+    dkms install "${module_name}/${module_version}" -k "${current_kernel}"
 
     popd >/dev/null
 
@@ -293,7 +258,6 @@ build_and_install_app() {
 
 start_services() {
     echo "--> Configuring and starting backend service..."
-
     systemd-tmpfiles --create || echo "Warning: Failed to create tmpfiles, continuing..."
     systemctl daemon-reload
     udevadm control --reload-rules
@@ -306,9 +270,9 @@ start_services() {
     systemctl is-active --quiet victus-backend.service
 }
 
-echo "--- Starting Victus Control Installation (Arch) ---"
+echo "--- Starting Victus Control Installation (Ubuntu) ---"
 echo "--> Installing required packages..."
-install_arch_dependencies
+install_ubuntu_dependencies
 ensure_users_and_groups
 install_helpers_and_sudoers
 install_temperature_monitor

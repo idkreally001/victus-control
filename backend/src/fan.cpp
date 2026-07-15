@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
 #include <atomic>
@@ -47,6 +48,15 @@ static std::atomic<bool> cpu_sensor_warned(false);
 static std::atomic<bool> gpu_sensor_warned(false);
 static std::atomic<bool> gpu_usage_warned(false);
 
+// NVIDIA dGPUs (e.g. RTX 40-series in HP Victus) expose no amdgpu-style hwmon
+// temp or /sys .../gpu_busy_percent, so the sysfs probes above find nothing.
+// Fall back to nvidia-smi, but only when the dGPU is already powered — never
+// wake a runtime-suspended GPU just to poll it.
+static std::once_flag nvidia_probe_once;
+static bool nvidia_smi_available = false;
+static std::string nvidia_runtime_status_path;   // PCI power/runtime_status of the NVIDIA card
+static std::atomic<bool> nvidia_probe_warned(false);
+
 struct CpuSampleTimes {
     unsigned long long idle;
     unsigned long long total;
@@ -54,7 +64,7 @@ struct CpuSampleTimes {
 static std::mutex cpu_usage_mutex;
 static std::optional<CpuSampleTimes> previous_cpu_times;
 
-static constexpr int kBetterAutoMinRpm = 2600;
+static constexpr int kBetterAutoMinRpm = 2000;
 static constexpr std::array<int, 2> kBetterAutoMaxFallback = {5800, 6100};
 static constexpr int kBetterAutoSteps = 8;
 static constexpr std::chrono::seconds kBetterAutoTick{2};
@@ -372,6 +382,115 @@ static std::optional<double> read_gpu_usage_pct()
     return value;
 }
 
+// Locate an NVIDIA discrete GPU under /sys/bus/pci and confirm nvidia-smi is
+// usable. Runs once. Records the card's power/runtime_status path so callers
+// can skip polling while the GPU is runtime-suspended.
+static void probe_nvidia_gpu()
+{
+    std::call_once(nvidia_probe_once, []() {
+        DIR *dir = opendir("/sys/bus/pci/devices");
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != nullptr) {
+                if (entry->d_name[0] == '.') {
+                    continue;
+                }
+                std::string dev = std::string("/sys/bus/pci/devices/") + entry->d_name;
+
+                std::ifstream class_file(dev + "/class");
+                std::string dev_class;
+                if (class_file) {
+                    std::getline(class_file, dev_class);
+                }
+                // PCI class 0x03xxxx == display controller (VGA/3D).
+                if (dev_class.rfind("0x03", 0) != 0) {
+                    continue;
+                }
+
+                std::ifstream vendor_file(dev + "/vendor");
+                std::string vendor;
+                if (vendor_file) {
+                    std::getline(vendor_file, vendor);
+                }
+                if (to_lower_copy(vendor).find("0x10de") != std::string::npos) { // NVIDIA
+                    nvidia_runtime_status_path = dev + "/power/runtime_status";
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+
+        if (nvidia_runtime_status_path.empty()) {
+            return; // no NVIDIA dGPU on this machine
+        }
+
+        // Confirm nvidia-smi exists and responds; a silent probe keeps the log clean.
+        if (FILE *pipe = popen("timeout 3 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null", "r")) {
+            char buf[64];
+            bool got_output = fgets(buf, sizeof(buf), pipe) != nullptr;
+            int rc = pclose(pipe);
+            nvidia_smi_available = got_output && rc == 0;
+        }
+
+        if (!nvidia_smi_available && !nvidia_probe_warned.exchange(true)) {
+            std::cerr << "better-auto: NVIDIA dGPU present but nvidia-smi unavailable; GPU sensing disabled" << std::endl;
+        }
+    });
+}
+
+static bool nvidia_gpu_is_powered()
+{
+    if (nvidia_runtime_status_path.empty()) {
+        return false;
+    }
+    std::ifstream status_file(nvidia_runtime_status_path);
+    if (!status_file) {
+        return false;
+    }
+    std::string status;
+    std::getline(status_file, status);
+    // "active" == powered. "suspended" == runtime-PM asleep; do not wake it.
+    return status == "active";
+}
+
+// Query the NVIDIA GPU temperature (°C) and utilisation (%) in one nvidia-smi
+// call. Returns nullopt for each field it can't read. Only call when powered.
+static void read_nvidia_gpu(std::optional<double> &temp_out, std::optional<double> &usage_out)
+{
+    probe_nvidia_gpu();
+    if (!nvidia_smi_available || !nvidia_gpu_is_powered()) {
+        return;
+    }
+
+    // timeout guards the 2s control loop: a hung nvidia-smi (driver hiccup)
+    // must not stall the MANUAL reassert / fan reapply and freeze the fans.
+    FILE *pipe = popen(
+        "timeout 3 nvidia-smi --query-gpu=temperature.gpu,utilization.gpu "
+        "--format=csv,noheader,nounits 2>/dev/null", "r");
+    if (!pipe) {
+        return;
+    }
+
+    char line[128] = {0};
+    bool have_line = fgets(line, sizeof(line), pipe) != nullptr;
+    pclose(pipe);
+    if (!have_line) {
+        return;
+    }
+
+    // Expected: "73, 44"
+    double temp = 0.0;
+    double usage = 0.0;
+    char comma = '\0';
+    std::istringstream iss(line);
+    if (iss >> temp >> comma && comma == ',') {
+        temp_out = temp;
+    }
+    if (iss >> usage) {
+        usage_out = usage;
+    }
+}
+
 static ThermalSnapshot collect_snapshot()
 {
     ThermalSnapshot snapshot;
@@ -379,6 +498,30 @@ static ThermalSnapshot collect_snapshot()
     snapshot.gpu_temp_c = read_temperature_celsius(locate_gpu_temp_sensor());
     snapshot.cpu_usage_pct = read_cpu_usage_pct();
     snapshot.gpu_usage_pct = read_gpu_usage_pct();
+
+    // On NVIDIA laptops the sysfs GPU probes find nothing useful: there is no
+    // gpu_busy_percent (usage stays empty) and find_hwmon_temp_sensor hands
+    // back a *fallback* sensor (nvme/coretemp), so gpu_temp_c is non-empty but
+    // wrong. Whenever nvidia-smi has real readings, override both — not just
+    // the empty slot — so the bogus sysfs temp fallback doesn't win.
+    // On AMD boxes both sysfs values are real, so this block never runs.
+    if (!snapshot.gpu_temp_c || !snapshot.gpu_usage_pct) {
+        probe_nvidia_gpu();
+        if (!nvidia_runtime_status_path.empty()) {
+            // This is an NVIDIA box, so any sysfs GPU temp is a bogus fallback
+            // (a non-GPU hwmon). Discard it and trust nvidia-smi exclusively.
+            snapshot.gpu_temp_c.reset();
+            snapshot.gpu_usage_pct.reset();
+
+            std::optional<double> nv_temp;
+            std::optional<double> nv_usage;
+            read_nvidia_gpu(nv_temp, nv_usage);
+            // If the dGPU is runtime-suspended both stay empty — correct: a
+            // sleeping GPU contributes no heat, so fans idle on CPU alone.
+            snapshot.gpu_temp_c = nv_temp;
+            snapshot.gpu_usage_pct = nv_usage;
+        }
+    }
     return snapshot;
 }
 
@@ -430,6 +573,12 @@ static int rpm_for_level_for_fan(int level, size_t fan_index)
     if (kBetterAutoSteps <= 1) {
         return max_rpm;
     }
+    // If the fan's reported maximum is at or below our quiet floor there is
+    // nothing to interpolate, and the std::clamp(rpm, min, max) below would be
+    // undefined behaviour with min > max. Return the hardware maximum.
+    if (max_rpm <= kBetterAutoMinRpm) {
+        return max_rpm;
+    }
 
     double step = static_cast<double>(max_rpm - kBetterAutoMinRpm) / static_cast<double>(kBetterAutoSteps - 1);
     double value = static_cast<double>(kBetterAutoMinRpm) + static_cast<double>(level - 1) * step;
@@ -445,8 +594,11 @@ static std::array<int, 2> rpm_for_level(int level)
 
 static int level_from_snapshot(const ThermalSnapshot &snapshot, int previous_level)
 {
-    const std::array<double, 7> temp_thresholds = {45.0, 55.0, 65.0, 70.0, 75.0, 80.0, 84.0};
-    const std::array<double, 7> usage_thresholds = {15.0, 20.0, 25.0, 35.0, 45.0, 55.0, 65.0};
+    // Levels 1-8 map to ~2000→max RPM. Thresholds define boundaries between consecutive levels.
+    // Temp: <45°C=L1(silent), 45-54=L2, 54-62=L3, 62-68=L4, 68-73=L5, 73-78=L6, 78-83=L7, >83=L8(max)
+    // Usage: low-usage background noise won't spin fans; only sustained load matters
+    const std::array<double, 7> temp_thresholds = {45.0, 54.0, 62.0, 68.0, 73.0, 78.0, 83.0};
+    const std::array<double, 7> usage_thresholds = {30.0, 45.0, 55.0, 65.0, 75.0, 85.0, 92.0};
 
     double hottest = 0.0;
     bool have_temp = false;
@@ -628,8 +780,8 @@ static std::string write_hw_fan_mode(const std::string &mode)
 static void better_auto_worker()
 {
     std::cout << "better-auto: control loop started" << std::endl;
-    int current_level = 3;
-    int sensor_level = 3;
+    int current_level = 1;
+    int sensor_level = 1;
     auto last_apply = std::chrono::steady_clock::time_point::min();
     better_auto_last_manual_assert = std::chrono::steady_clock::time_point::min();
     auto cooldown_until = std::chrono::steady_clock::time_point::min();
@@ -640,6 +792,22 @@ static void better_auto_worker()
         sensor_level = level_from_snapshot(snapshot, sensor_level);
         int target_level = sensor_level;
         auto now = std::chrono::steady_clock::now();
+
+        // Log the snapshot only when the computed level changes, to keep the
+        // journal quiet during steady state instead of a line every 2s.
+        static int last_logged_level = -1;
+        if (sensor_level != last_logged_level) {
+            std::cout << "better-auto: cpu_temp="
+                      << (snapshot.cpu_temp_c ? std::to_string(static_cast<int>(*snapshot.cpu_temp_c)) : "n/a")
+                      << " gpu_temp="
+                      << (snapshot.gpu_temp_c ? std::to_string(static_cast<int>(*snapshot.gpu_temp_c)) : "n/a")
+                      << " cpu_use="
+                      << (snapshot.cpu_usage_pct ? std::to_string(static_cast<int>(*snapshot.cpu_usage_pct)) : "n/a")
+                      << " gpu_use="
+                      << (snapshot.gpu_usage_pct ? std::to_string(static_cast<int>(*snapshot.gpu_usage_pct)) : "n/a")
+                      << " level=" << sensor_level << std::endl;
+            last_logged_level = sensor_level;
+        }
 
         if (cooldown_level > 0 && now >= cooldown_until) {
             cooldown_level = 0;
@@ -699,8 +867,15 @@ static void better_auto_worker()
             last_apply = now;
         }
 
+        // Cooldown grace: once the machine has recently run hot, hold a modest
+        // floor (kBetterAutoCooldownLevel) for a short window so a brief temp
+        // dip doesn't drop the fans only to re-spin seconds later. The floor is
+        // fixed at the trigger level and the window is refreshed only while the
+        // sensor is still hot — it must NOT ratchet up to the running peak or
+        // re-arm forever, or the fans stay pinned high through the whole
+        // session and never idle back down.
         if (sensor_level >= kBetterAutoCooldownLevel) {
-            cooldown_level = std::max(cooldown_level, current_level);
+            cooldown_level = kBetterAutoCooldownLevel;
             cooldown_until = now + kBetterAutoCooldown;
         }
 
@@ -1001,6 +1176,34 @@ std::string get_cpu_temperature()
 	}
 
 	return std::to_string(static_cast<int>(std::lround(*cpu_temp)));
+}
+
+std::string get_gpu_temperature()
+{
+	// Prefer a real sysfs GPU sensor (amdgpu); on NVIDIA boxes that probe only
+	// yields a bogus fallback, so query nvidia-smi when the dGPU is awake.
+	std::optional<double> gpu_temp;
+
+	probe_nvidia_gpu();
+	if (!nvidia_runtime_status_path.empty()) {
+		std::optional<double> nv_temp;
+		std::optional<double> nv_usage;
+		read_nvidia_gpu(nv_temp, nv_usage);
+		if (nv_temp) {
+			gpu_temp = nv_temp;
+		} else {
+			// dGPU runtime-suspended: no reading, not an error.
+			return "IDLE";
+		}
+	} else {
+		gpu_temp = read_temperature_celsius(locate_gpu_temp_sensor());
+	}
+
+	if (!gpu_temp) {
+		return "ERROR: GPU temperature unavailable";
+	}
+
+	return std::to_string(static_cast<int>(std::lround(*gpu_temp)));
 }
 
 std::string set_fan_speed(const std::string &fan_num, const std::string &speed, bool trigger_mode, bool update_cache)

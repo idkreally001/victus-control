@@ -1,0 +1,42 @@
+[Unit]
+Description=Victus Fan Controller (userspace hp-wmi two-state fan daemon)
+Documentation=file:///usr/share/doc/victus-fan/README.md
+# Start once the system is fully up; hp-wmi/hwmon is available well before this.
+After=multi-user.target
+# The DKMS-based victus-backend drives the same pwm1_enable knob; never let both
+# run at once (they would fight over the fans). Enabling one stops the other.
+Conflicts=victus-backend.service
+
+[Service]
+Type=simple
+# Daemon runs as root: it must write sysfs (pwm1_enable) and /run/victus-fan.
+User=root
+ExecStart=/usr/lib/victus-fan/victus-fand
+# Keep the controller alive across transient errors; the daemon itself also
+# guards every loop, but a hard crash should still be recovered.
+Restart=always
+RestartSec=3
+# The daemon traps SIGTERM/SIGINT and writes "2" (AUTO) to pwm1_enable on a
+# clean exit. ExecStopPost is defense-in-depth for the cases the handler cannot
+# cover (SIGKILL, OOM, TimeoutStopSec breach): it globs every hp-wmi hwmon node
+# so it does not hard-code a path that can renumber, and hands the fans back to
+# the firmware curve. Runs on every stop; harmless when AUTO is already set.
+ExecStopPost=/bin/sh -c 'for d in /sys/devices/platform/hp-wmi/hwmon/hwmon*/; do [ -w "$d/pwm1_enable" ] && echo 2 > "$d/pwm1_enable"; done; exit 0'
+
+# Sandboxing: this daemon only needs to write sysfs pwm, /run and /etc config,
+# and exec nvidia-smi. Keep the hardening conservative so none of that breaks --
+# in particular do NOT set ProtectKernelTunables=yes (it remounts /sys read-only
+# and would block the pwm1_enable write).
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Jayesh Barman
+"""
+victus-fanctl — command-line control for victus-fand.
+
+Runs as the user. It only READS /run/victus-fan/status.json (world-readable)
+and WRITES /etc/victus-fan/config.json atomically (group victusfan, setgid dir).
+
+Subcommands:
+  status                       pretty-print the live daemon status
+  get                          print the merged effective config (JSON)
+  override max|auto|policy     force fans MAX/AUTO, or hand back to policy
+  set <profile> <key> <int>    set an integer threshold in profiles.<profile>
+  enable                       set enabled=true
+  disable                      set enabled=false
+
+Pure python3 stdlib only.
+"""
+
+import json
+import os
+import sys
+
+CONFIG_PATH = "/etc/victus-fan/config.json"
+STATUS_PATH = "/run/victus-fan/status.json"
+
+# Mirror of the daemon defaults so `get` and `set` behave even before the
+# daemon has ever written a config (kept intentionally in sync with the daemon).
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "poll_interval_sec": 2,
+    "low_battery_pct": 20,
+    "override": "policy",
+    "profile_map": {
+        "performance": "performance",
+        "balanced": "balanced",
+        "quiet": "power-saver",
+        "cool": "power-saver",
+        "low-power": "power-saver",
+    },
+    "profiles": {
+        "performance": {"always_max": True},
+        "balanced": {
+            "cpu_on": 85, "cpu_off": 75,
+            "igpu_on": 70, "igpu_off": 60,
+            "dgpu_on": 72, "dgpu_off": 62,
+        },
+        "power-saver": {
+            "cpu_on": 90, "cpu_off": 80,
+            "igpu_on": 78, "igpu_off": 68,
+            "dgpu_on": 80, "dgpu_off": 70,
+        },
+    },
+}
+
+VALID_OVERRIDES = ("max", "auto", "policy")
+
+PERM_HELP = (
+    "Permission denied writing %s.\n"
+    "You must be a member of the 'victusfan' group, then log out and back in\n"
+    "(or run: newgrp victusfan). Alternatively run this command via pkexec/sudo."
+) % CONFIG_PATH
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def err(msg):
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+
+
+def deep_merge(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_raw_config():
+    """
+    Load the on-disk config dict (NOT merged with defaults), so we can mutate
+    and write it back preserving exactly what the user has. Returns {} if the
+    file does not exist; raises on JSON errors.
+    """
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("config root is not a JSON object")
+    return data
+
+
+def load_effective_config():
+    """Return on-disk config merged over defaults (what the daemon would use)."""
+    try:
+        raw = load_raw_config()
+    except Exception as exc:  # noqa: BLE001
+        err("warning: config unreadable (%s); showing defaults" % exc)
+        raw = {}
+    return deep_merge(DEFAULT_CONFIG, raw)
+
+
+def atomic_write_config(data):
+    """
+    Atomically write `data` (dict) to CONFIG_PATH by creating a temp file in the
+    SAME directory and os.replace()-ing it onto config.json. Surfaces a clear
+    message on PermissionError.
+    """
+    directory = os.path.dirname(CONFIG_PATH) or "."
+    payload = json.dumps(data, indent=2) + "\n"
+    tmp = os.path.join(directory, ".config.json.tmp.%d" % os.getpid())
+    try:
+        # Honor the setgid dir + umask; aim for 0664 so the group can rewrite.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o664)
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        # Defeat the process umask (which would knock 0664 down to 0644) so the
+        # file stays group-writable for other 'victusfan' members. chmod ignores
+        # umask; the writer always owns this freshly-created temp so it succeeds.
+        try:
+            os.chmod(tmp, 0o664)
+        except OSError:
+            pass
+        os.replace(tmp, CONFIG_PATH)
+    except PermissionError:
+        _cleanup(tmp)
+        err(PERM_HELP)
+        sys.exit(13)
+    except OSError as exc:
+        _cleanup(tmp)
+        err("error writing config: %s" % exc)
+        sys.exit(1)
+
+
+def _cleanup(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def mutate_config(mutator):
+    """Load raw config, apply mutator(dict)->dict, write atomically."""
+    try:
+        raw = load_raw_config()
+    except Exception as exc:  # noqa: BLE001
+        err("error: cannot parse existing config (%s)" % exc)
+        sys.exit(1)
+    new = mutator(raw)
+    atomic_write_config(new)
+
+
+# ----------------------------------------------------------------------------
+# Subcommands
+# ----------------------------------------------------------------------------
+def cmd_status(_args):
+    try:
+        with open(STATUS_PATH, "r") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        err("no status yet at %s — is victus-fand running? (systemctl status victus-fan)"
+            % STATUS_PATH)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        err("error reading status: %s" % exc)
+        return 1
+
+    temps = st.get("temps", {}) or {}
+    fan = st.get("fan", {}) or {}
+
+    def fmt_temp(v):
+        return "n/a" if v is None else ("%.1f C" % v)
+
+    def fmt_rpm(v):
+        return "n/a" if v is None else ("%d rpm" % v)
+
+    lines = []
+    lines.append("victus-fan status")
+    lines.append("  enabled        : %s" % st.get("enabled"))
+    lines.append("  override       : %s" % st.get("override"))
+    lines.append("  power profile  : %s" % st.get("power_profile_raw"))
+    lines.append("  policy         : %s" % st.get("policy"))
+    lines.append("  effective      : %s" % st.get("effective_policy"))
+    batt = st.get("battery_pct")
+    batt_s = "n/a" if batt is None else ("%d%%" % batt)
+    src = "battery" if st.get("on_battery") else "AC"
+    low = " (LOW)" if st.get("low_battery_active") else ""
+    lines.append("  power source   : %s  battery %s%s" % (src, batt_s, low))
+    lines.append("  temps          : cpu %s | igpu %s | dgpu %s [%s]" % (
+        fmt_temp(temps.get("cpu")),
+        fmt_temp(temps.get("igpu")),
+        fmt_temp(temps.get("dgpu")),
+        temps.get("dgpu_state"),
+    ))
+    lines.append("  fan            : %s  (fan1 %s, fan2 %s, pwm_enable=%s)" % (
+        fan.get("state"),
+        fmt_rpm(fan.get("rpm1")),
+        fmt_rpm(fan.get("rpm2")),
+        fan.get("pwm_enable"),
+    ))
+    lines.append("  reason         : %s" % st.get("decision_reason"))
+    ts = st.get("ts")
+    if isinstance(ts, (int, float)):
+        age = max(0.0, _now() - ts)
+        lines.append("  updated        : %.1fs ago" % age)
+    print("\n".join(lines))
+    return 0
+
+
+def _now():
+    import time
+    return time.time()
+
+
+def cmd_get(_args):
+    print(json.dumps(load_effective_config(), indent=2))
+    return 0
+
+
+def cmd_override(args):
+    if len(args) != 1 or args[0] not in VALID_OVERRIDES:
+        err("usage: victus-fanctl override max|auto|policy")
+        return 2
+    value = args[0]
+
+    def m(cfg):
+        cfg["override"] = value
+        return cfg
+
+    mutate_config(m)
+    print("override set to '%s'" % value)
+    return 0
+
+
+def cmd_set(args):
+    if len(args) != 3:
+        err("usage: victus-fanctl set <profile> <key> <int>")
+        return 2
+    profile, key, raw_val = args
+    try:
+        value = int(raw_val)
+    except ValueError:
+        err("error: value must be an integer, got %r" % raw_val)
+        return 2
+
+    # Reject a threshold pair where on <= off: compute_hysteresis would then
+    # flip MAX->AUTO->MAX every poll, hammering the fans. Validate against the
+    # effective (on-disk merged over defaults) value of the paired key.
+    if key.endswith("_on") or key.endswith("_off"):
+        prefix = key.rsplit("_", 1)[0]
+        on_key, off_key = prefix + "_on", prefix + "_off"
+        eff_prof = load_effective_config().get("profiles", {}).get(profile, {})
+        on_val = value if key == on_key else eff_prof.get(on_key)
+        off_val = value if key == off_key else eff_prof.get(off_key)
+        if (isinstance(on_val, (int, float))
+                and isinstance(off_val, (int, float))
+                and on_val <= off_val):
+            err("error: %s (%s) must be greater than %s (%s); on<=off makes the "
+                "fans oscillate every poll" % (on_key, on_val, off_key, off_val))
+            return 2
+
+    def m(cfg):
+        profiles = cfg.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            cfg["profiles"] = profiles
+        prof = profiles.get(profile)
+        if not isinstance(prof, dict):
+            prof = {}
+            profiles[profile] = prof
+        prof[key] = value
+        return cfg
+
+    mutate_config(m)
+    print("set profiles.%s.%s = %d" % (profile, key, value))
+    return 0
+
+
+def cmd_enable(_args):
+    def m(cfg):
+        cfg["enabled"] = True
+        return cfg
+
+    mutate_config(m)
+    print("enabled")
+    return 0
+
+
+def cmd_disable(_args):
+    def m(cfg):
+        cfg["enabled"] = False
+        return cfg
+
+    mutate_config(m)
+    print("disabled")
+    return 0
+
+
+USAGE = """\
+victus-fanctl — control victus-fand
+
+usage:
+  victus-fanctl status
+  victus-fanctl get
+  victus-fanctl override max|auto|policy
+  victus-fanctl set <profile> <key> <int>
+  victus-fanctl enable
+  victus-fanctl disable
+"""
+
+
+def main(argv):
+    if not argv:
+        sys.stderr.write(USAGE)
+        return 2
+
+    cmd = argv[0]
+    rest = argv[1:]
+
+    handlers = {
+        "status": cmd_status,
+        "get": cmd_get,
+        "override": cmd_override,
+        "set": cmd_set,
+        "enable": cmd_enable,
+        "disable": cmd_disable,
+    }
+
+    if cmd in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0
+
+    handler = handlers.get(cmd)
+    if handler is None:
+        err("unknown command: %s" % cmd)
+        sys.stderr.write(USAGE)
+        return 2
+
+    return handler(rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

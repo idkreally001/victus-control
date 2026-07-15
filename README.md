@@ -19,16 +19,23 @@ Fan control and keyboard lighting for HP Victus / Omen laptops on Linux. Stock f
 - **GNOME Shell integration** exposes fan and keyboard controls from the top panel.
 
 ## Support Matrix
-- **Main installer**: Arch-based distros and Fedora.
+- **Main installer**: Arch-based distros, Fedora, and Ubuntu/Debian-based distros.
 - **Desktop app**: GTK4 app installed by the main project installer.
 - **GNOME Shell extension**: supported on GNOME Shell 45+ and auto-installed by `install.sh` when GNOME is present.
-- **Ubuntu GNOME**: the extension should work on GNOME-based Ubuntu setups if `victus-backend.service` is already installed and reachable, but the project does not currently ship a full Ubuntu installer.
+- **Ubuntu / Debian**: contributor-tested on Ubuntu 24.04 LTS (GNOME 46). Other Debian-based distros use the same installer path but are less tested.
+
+## Ubuntu / Secure Boot (userspace, no kernel module)
+
+If you can't load the patched `hp-wmi` DKMS module — most notably on **Ubuntu with Secure Boot enabled**, where unsigned out-of-tree modules are rejected — see [`victus-fan/`](victus-fan/). It is a self-contained **userspace** controller that drives the **stock** in-tree `hp-wmi` driver (two-state `pwm1_enable`, no kernel module), tying fan speed to your power profile and CPU / iGPU / NVIDIA temperature via a small daemon + CLI (no GUI). Tested on an HP Victus 15-fb0xxx running Ubuntu 26.04 — see [`victus-fan/README.md`](victus-fan/README.md).
+
+> **Pick one fan controller, not both.** `victus-fan` and the main `victus-backend` (installed by the DKMS installers above) both write the same `pwm1_enable` knob; running both at once makes them fight over the fans. Use `victus-fan` **instead of** the DKMS stack on machines where the patched module can't load — not alongside it.
 
 ## System Requirements
 - 64-bit Linux with `systemd`.
 - Supported installer targets:
   - Arch-based distros via `pacman`
   - Fedora via `dnf`
+  - Ubuntu/Debian-based distros via `apt-get`
 - GNOME Shell 45+ if you want the panel extension.
 - Root privileges for installing the DKMS module, sudoers rules, and systemd units.
 
@@ -45,13 +52,18 @@ git clone https://github.com/Batuhan4/victus-control.git
 cd victus-control
 sudo ./install.sh
 ```
-The wrapper routes to `arch-install.sh` or `fedora-install.sh` based on your OS.
+The wrapper routes to `arch-install.sh`, `fedora-install.sh`, or `ubuntu-install.sh` based on your OS.
 On GNOME systems, it also installs the panel extension for the desktop user automatically.
 
 ### Fedora notes
 - Validated by contributors on `HP Victus 16-S0046NT` with Fedora 43.
 - The Fedora installer now verifies that the patched `hp_wmi` module is actually active before starting the backend.
 - If you recently updated the kernel, reboot first so the running kernel matches the installed `kernel-devel` package.
+
+### Ubuntu / Debian notes
+- Contributor-tested on Ubuntu 24.04 LTS (GNOME 46) with an HP Victus 16.
+- The installer accepts DKMS-managed `hp_wmi` module layouts used by both `/extra` and `/updates/dkms`.
+- Secure Boot can block the DKMS module from loading. If install succeeds but `hp_wmi` still does not load, enroll the MOK key with `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der` or disable Secure Boot, then reboot.
 
 The installer handles dependency install, user/group creation, DKMS module registration, build + install, and restarts `victus-backend.service`. Log out/in afterwards so your user joins the `victus` group.
 
@@ -108,11 +120,11 @@ sudo meson install -C build
 - The installer fetches `hp-wmi-fan-and-backlight-control`; it’s git-ignored to keep the repo lean.
 
 ## Troubleshooting
-- **Fans ignore commands**: ensure the DKMS module is loaded (`dkms status | grep hp-wmi-fan-and-backlight-control`, `modprobe --show-depends hp_wmi | tail -n1` should point at `/extra/hp-wmi.ko.xz`).
+- **Fans ignore commands**: ensure the DKMS module is loaded (`dkms status | grep hp-wmi-fan-and-backlight-control`, `modprobe --show-depends hp_wmi | tail -n1` should point at the DKMS-built `hp-wmi.ko` under `/updates/dkms/` on Arch or `/extra/` on other distros).
 - **Permission errors**: confirm `victus` group membership (`groups $USER`), then re-run the installer or `sudo usermod -aG victus $USER`.
 - **Socket missing**: `sudo systemd-tmpfiles --create`; `sudo systemctl restart victus-backend.service`.
 - **GNOME extension missing after install**: log out/in once, then run `gnome-extensions enable victus-control@victus`.
-- **Uninstall**: `sudo systemctl disable --now victus-backend` and `sudo dkms remove hp-wmi-fan-and-backlight-control/0.0.2 --all`.
+- **Uninstall**: `sudo systemctl disable --now victus-backend` and `sudo dkms remove hp-wmi-fan-and-backlight-control/$(dkms status -m hp-wmi-fan-and-backlight-control | sed -n 's#.*/\([^,]*\),.*#\1#p' | head -n1) --all` (or substitute the version shown by `dkms status`).
 
 ## Contributing
 See `AGENTS.md` for coding style, testing, and PR expectations. Hardware validation notes are welcome in PR descriptions.

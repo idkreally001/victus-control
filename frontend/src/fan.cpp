@@ -6,6 +6,19 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <memory>
+
+namespace {
+// Carries the strings produced by the off-thread refresh back to the GTK main
+// thread, where the label writes must happen.
+struct FanLabelUpdate {
+    VictusFanControl *self;
+    std::string fan1;
+    std::string fan2;
+    std::string cpu;
+    std::string gpu;
+};
+} // namespace
 
 // Constants for manual fan control
 const int MIN_RPM = 2000;
@@ -53,11 +66,23 @@ VictusFanControl::VictusFanControl(std::shared_ptr<VictusSocketClient> client) :
     gtk_widget_set_halign(fan2_speed_label, GTK_ALIGN_START);
     gtk_box_append(GTK_BOX(fan_page), fan2_speed_label);
 
-    // Initial UI state update
+    cpu_temp_label = gtk_label_new("CPU Temp: N/A °C");
+    gtk_widget_set_halign(cpu_temp_label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(fan_page), cpu_temp_label);
+
+    gpu_temp_label = gtk_label_new("GPU Temp: N/A °C");
+    gtk_widget_set_halign(gpu_temp_label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(fan_page), gpu_temp_label);
+
+    // Block "changed" signal during init so set_active_id doesn't fire
+    // on_mode_changed and reset fan speeds with the slider's default value.
+    g_signal_handlers_block_by_func(mode_selector, (gpointer)on_mode_changed, this);
     update_ui_from_system_state();
+    g_signal_handlers_unblock_by_func(mode_selector, (gpointer)on_mode_changed, this);
+
     update_fan_speeds();
 
-    // Set up a timer to periodically update fan speeds
+    // Set up a timer to periodically update fan speeds and temps
     g_timeout_add_seconds(2, [](gpointer data) -> gboolean {
         static_cast<VictusFanControl*>(data)->update_fan_speeds();
         return G_SOURCE_CONTINUE;
@@ -102,16 +127,64 @@ void VictusFanControl::update_ui_from_system_state()
 
 void VictusFanControl::update_fan_speeds()
 {
-    auto response1 = socket_client->send_command_async(GET_FAN_SPEED, "1");
-    std::string fan1_speed = response1.get();
-    if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
+    // The socket client serialises every call on one connection, and
+    // GET_GPU_TEMP makes the backend run `timeout 3 nvidia-smi` when the dGPU is
+    // awake. Doing the blocking .get()s on the GTK main thread (this is called
+    // from a 2 s g_timeout) freezes the UI for up to ~3 s per tick. So run the
+    // round-trips on a worker thread and marshal the label writes back to the
+    // main thread with g_idle_add. Skip if a prior refresh is still running so
+    // slow ticks don't pile up overlapping workers.
+    bool expected = false;
+    if (!refresh_in_flight.compare_exchange_strong(expected, true)) {
+        return;
+    }
 
-    auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
-    std::string fan2_speed = response2.get();
-    if (fan2_speed.find("ERROR") != std::string::npos) fan2_speed = "N/A";
+    std::thread([this]() {
+        auto response1 = socket_client->send_command_async(GET_FAN_SPEED, "1");
+        auto response2 = socket_client->send_command_async(GET_FAN_SPEED, "2");
+        auto response_temp = socket_client->send_command_async(GET_CPU_TEMP);
+        auto response_gpu_temp = socket_client->send_command_async(GET_GPU_TEMP);
 
-    gtk_label_set_text(GTK_LABEL(fan1_speed_label), ("Fan 1 Speed: " + fan1_speed + " RPM").c_str());
-    gtk_label_set_text(GTK_LABEL(fan2_speed_label), ("Fan 2 Speed: " + fan2_speed + " RPM").c_str());
+        std::string fan1_speed = response1.get();
+        if (fan1_speed.find("ERROR") != std::string::npos) fan1_speed = "N/A";
+
+        std::string fan2_speed = response2.get();
+        if (fan2_speed.find("ERROR") != std::string::npos) fan2_speed = "N/A";
+
+        std::string cpu_temp = response_temp.get();
+        if (cpu_temp.find("ERROR") != std::string::npos) cpu_temp = "N/A";
+
+        // GPU: "IDLE" means the dGPU is runtime-suspended (no reading, not an error).
+        std::string gpu_temp = response_gpu_temp.get();
+        std::string gpu_temp_text;
+        if (gpu_temp == "IDLE") {
+            gpu_temp_text = "GPU Temp: idle";
+        } else if (gpu_temp.find("ERROR") != std::string::npos) {
+            gpu_temp_text = "GPU Temp: N/A °C";
+        } else {
+            gpu_temp_text = "GPU Temp: " + gpu_temp + " °C";
+        }
+
+        auto *payload = new FanLabelUpdate{
+            this,
+            "Fan 1 Speed: " + fan1_speed + " RPM",
+            "Fan 2 Speed: " + fan2_speed + " RPM",
+            "CPU Temp: " + cpu_temp + " °C",
+            gpu_temp_text};
+
+        g_idle_add(
+            +[](gpointer data) -> gboolean {
+                std::unique_ptr<FanLabelUpdate> u(static_cast<FanLabelUpdate *>(data));
+                VictusFanControl *self = u->self;
+                gtk_label_set_text(GTK_LABEL(self->fan1_speed_label), u->fan1.c_str());
+                gtk_label_set_text(GTK_LABEL(self->fan2_speed_label), u->fan2.c_str());
+                gtk_label_set_text(GTK_LABEL(self->cpu_temp_label), u->cpu.c_str());
+                gtk_label_set_text(GTK_LABEL(self->gpu_temp_label), u->gpu.c_str());
+                self->refresh_in_flight.store(false);
+                return G_SOURCE_REMOVE;
+            },
+            payload);
+    }).detach();
 }
 
 void VictusFanControl::set_fan_rpm(int level)
@@ -171,32 +244,28 @@ void VictusFanControl::set_fan_rpm(int level)
 void VictusFanControl::on_mode_changed(GtkComboBox *widget, gpointer data)
 {
     VictusFanControl *self = static_cast<VictusFanControl*>(data);
-    gchar *mode = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(widget));
+    // get_active_id returns a const pointer owned by GTK — copy immediately, never free
+    const gchar *active_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(widget));
+    if (!active_id) return;
+    std::string mode_str(active_id);
 
-    if (mode) {
-        std::string mode_str(mode);
-        
-        // Send the mode command and wait for it to complete.
-        auto result = self->socket_client->send_command_async(SET_FAN_MODE, mode_str).get();
+    // Send the mode command and wait for it to complete.
+    auto result = self->socket_client->send_command_async(SET_FAN_MODE, mode_str).get();
 
-        if (result == "OK") {
-            // If we are entering manual mode, now we can safely set the fan speed.
-            if (mode_str == "MANUAL") {
-                int level = static_cast<int>(gtk_range_get_value(GTK_RANGE(self->speed_slider)));
-                self->set_fan_rpm(level);
-            } else if (mode_str == "BETTER_AUTO") {
-                gtk_widget_set_sensitive(self->speed_slider, FALSE);
-                gtk_widget_set_sensitive(self->slider_label, FALSE);
-            }
-        } else {
-            std::cerr << "Failed to set fan mode: " << result << std::endl;
+    if (result == "OK") {
+        if (mode_str == "MANUAL") {
+            int level = static_cast<int>(gtk_range_get_value(GTK_RANGE(self->speed_slider)));
+            self->set_fan_rpm(level);
+        } else if (mode_str == "BETTER_AUTO") {
+            gtk_widget_set_sensitive(self->speed_slider, FALSE);
+            gtk_widget_set_sensitive(self->slider_label, FALSE);
         }
-        
-        g_free(mode);
-        
-        // After all commands are sent, update the UI to reflect the final state.
-        self->update_ui_from_system_state();
+    } else {
+        std::cerr << "Failed to set fan mode: " << result << std::endl;
     }
+
+    // After all commands are sent, update the UI to reflect the final state.
+    self->update_ui_from_system_state();
 }
 
 void VictusFanControl::on_speed_slider_changed(GtkRange *range, gpointer data)

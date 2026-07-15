@@ -41,14 +41,9 @@ void on_client_disconnected() {
   }
   std::cout << "Client disconnected (active: " << current << ")" << std::endl;
 
-  if (current == 0) {
-    auto result = ensure_better_auto_mode();
-    if (result != "OK") {
-      std::cerr
-          << "Failed to enforce BETTER_AUTO mode after client disconnect: "
-          << result << std::endl;
-    }
-  }
+  // Do not force Better Auto on disconnect — let the current mode persist.
+  // The backend already reapplies settings every 90s; forcing a mode switch
+  // here causes a fan spike when the new Better Auto loop starts cold.
 }
 
 void signal_handler(int) {
@@ -198,6 +193,12 @@ void handle_command(const std::string &command_str, int client_socket) {
       response = get_cpu_temperature();
     } else {
       response = "ERROR: Invalid GET_CPU_TEMP command format";
+    }
+  } else if (command == "GET_GPU_TEMP") {
+    if (!has_extra_tokens(ss)) {
+      response = get_gpu_temperature();
+    } else {
+      response = "ERROR: Invalid GET_GPU_TEMP command format";
     }
   } else if (command == "GET_KEYBOARD_COLOR") {
     if (!has_extra_tokens(ss)) {

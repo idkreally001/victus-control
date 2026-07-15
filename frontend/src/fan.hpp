@@ -25,6 +25,8 @@ private:
 	GtkWidget *state_label;
 	GtkWidget *fan1_speed_label;
 	GtkWidget *fan2_speed_label;
+	GtkWidget *cpu_temp_label;
+	GtkWidget *gpu_temp_label;
 
 	void update_fan_speeds();
 	void update_ui_from_system_state();
@@ -36,6 +38,9 @@ private:
 
 	std::shared_ptr<VictusSocketClient> socket_client;
     std::atomic<unsigned long long> manual_request_generation{0};
+    // Set while a periodic refresh worker is running so a slow backend call
+    // (GET_GPU_TEMP -> `timeout 3 nvidia-smi`) can't pile up overlapping workers.
+    std::atomic<bool> refresh_in_flight{false};
 };
 
 #endif // FAN_HPP

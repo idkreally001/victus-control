@@ -11,12 +11,23 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}"
 
 module_name="hp-wmi-fan-and-backlight-control"
-module_version="0.0.2"
+# Populated from the cloned module's dkms.conf so a version bump upstream
+# never leaves this installer pinned to a stale number.
+module_version=""
+
+read_module_version_from_dkms_conf() {
+    local conf="$1"
+    [[ -r "${conf}" ]] || return 1
+    local version
+    version="$(sed -n 's/^[[:space:]]*PACKAGE_VERSION=["'\'']*\([^"'\'' ]*\).*/\1/p' "${conf}" | head -n 1)"
+    [[ -n "${version}" ]] || return 1
+    printf '%s' "${version}"
+}
 
 verify_hp_wmi_fan_interface() {
     local hwmon_path
 
-    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' | head -n 1 || true)"
+    hwmon_path="$(find /sys/devices/platform/hp-wmi/hwmon -mindepth 1 -maxdepth 1 -type d -name 'hwmon*' 2>/dev/null | sort -V | tail -n 1 || true)"
     if [[ -z "${hwmon_path}" ]]; then
         echo "Error: hp_wmi hwmon directory not found." >&2
         return 1
@@ -36,14 +47,38 @@ warn_if_keyboard_interface_missing() {
     fi
 }
 
+resolve_hp_wmi_module_path() {
+    modprobe --show-depends hp_wmi 2>/dev/null \
+        | awk '$1 == "insmod" && $2 ~ /\/hp-wmi\.ko($|\.(gz|xz|zst)$)/ { print $2 }' \
+        | tail -n 1
+}
+
+hp_wmi_module_path_is_dkms() {
+    local module_path="${1:-}"
+
+    case "${module_path}" in
+        */extra/hp-wmi.ko|*/extra/hp-wmi.ko.*|*/updates/hp-wmi.ko|*/updates/hp-wmi.ko.*|*/updates/dkms/hp-wmi.ko|*/updates/dkms/hp-wmi.ko.*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
 reload_patched_hp_wmi() {
     local attempts=0
+    local module_path=""
 
     echo "--> Reloading patched hp-wmi module..."
     modprobe led_class_multicolor >/dev/null 2>&1 || true
 
-    if ! modprobe --show-depends hp_wmi | grep -q '/extra/hp-wmi\.ko'; then
-        echo "Error: modprobe hp_wmi is not resolving to the DKMS-installed module in /extra." >&2
+    module_path="$(resolve_hp_wmi_module_path || true)"
+    if ! hp_wmi_module_path_is_dkms "${module_path}"; then
+        if [[ -n "${module_path}" ]]; then
+            echo "Error: modprobe hp_wmi resolved to an unexpected module path: ${module_path}" >&2
+        else
+            echo "Error: Unable to determine which hp_wmi module modprobe would load." >&2
+        fi
         return 1
     fi
 
@@ -77,6 +112,8 @@ install_fedora_dependencies() {
         gcc-c++
         policycoreutils-python-utils
         sudo
+        python3
+        libnotify
     )
 
     dnf install -y "${packages[@]}"
@@ -135,6 +172,33 @@ install_helpers_and_sudoers() {
     fi
 }
 
+install_temperature_monitor() {
+    echo "--> Installing temperature monitor (per-user notifications)..."
+    install -m 0755 monitor/victus-monitor.py /usr/bin/victus-monitor
+    install -D -m 0644 monitor/victus-monitor.service \
+        /usr/lib/systemd/user/victus-monitor.service
+    systemctl daemon-reload
+
+    # The monitor runs in the desktop user's session (needs their D-Bus for
+    # notifications), so enable it for the invoking user, not root.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        local uid
+        uid="$(id -u "${SUDO_USER}")"
+        if sudo -u "${SUDO_USER}" \
+               XDG_RUNTIME_DIR="/run/user/${uid}" \
+               systemctl --user enable --now victus-monitor.service 2>/dev/null; then
+            echo "Enabled victus-monitor.service for user '${SUDO_USER}'."
+        else
+            echo "Note: could not enable victus-monitor for '${SUDO_USER}' now" \
+                 "(no active session?). It will start on next login."
+        fi
+    else
+        echo "Note: run the installer with sudo from your desktop user to" \
+             "auto-enable the temperature monitor. Otherwise enable it with:" \
+             "systemctl --user enable --now victus-monitor.service"
+    fi
+}
+
 install_hp_wmi_dkms() {
     local wmi_root="wmi-project"
     local wmi_repo="${wmi_root}/hp-wmi-fan-and-backlight-control"
@@ -151,6 +215,12 @@ install_hp_wmi_dkms() {
     fi
 
     pushd "${wmi_repo}" >/dev/null
+
+    module_version="$(read_module_version_from_dkms_conf dkms.conf)" || {
+        echo "Error: could not read PACKAGE_VERSION from dkms.conf." >&2
+        exit 1
+    }
+    echo "Detected hp-wmi module version ${module_version}."
 
     if dkms status -m "${module_name}" -v "${module_version}" >/dev/null 2>&1; then
         dkms remove "${module_name}/${module_version}" --all || true
@@ -206,6 +276,7 @@ echo "--> Installing required packages..."
 install_fedora_dependencies
 ensure_users_and_groups
 install_helpers_and_sudoers
+install_temperature_monitor
 install_hp_wmi_dkms
 build_and_install_app
 install_fedora_udev_rules

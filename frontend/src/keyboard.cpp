@@ -35,19 +35,19 @@ bool parse_rgb_triplet(const std::string &rgb_string, GdkRGBA *color) {
       blue > 255)
     return false;
 
-  *color = {red / 255.0, green / 255.0, blue / 255.0, 1.0};
+  *color = {static_cast<float>(red / 255.0), static_cast<float>(green / 255.0), static_cast<float>(blue / 255.0), 1.0f};
   return true;
 }
 
 bool parse_hex_color(const std::string &hex, GdkRGBA *color) {
-  if (hex.size() < 6)
+  if (hex.size() != 6)
     return false;
 
   try {
     int red = std::stoi(hex.substr(0, 2), nullptr, 16);
     int green = std::stoi(hex.substr(2, 2), nullptr, 16);
     int blue = std::stoi(hex.substr(4, 2), nullptr, 16);
-    *color = {red / 255.0, green / 255.0, blue / 255.0, 1.0};
+    *color = {static_cast<float>(red / 255.0), static_cast<float>(green / 255.0), static_cast<float>(blue / 255.0), 1.0f};
   } catch (...) {
     return false;
   }
@@ -350,7 +350,7 @@ void VictusKeyboardControl::build_ui_for_keyboard_type() {
     gtk_box_append(GTK_BOX(keyboard_page), info_label);
 
   } else {
-    // SINGLE_ZONE mode - simple color chooser
+    // SINGLE_ZONE mode
     keyboard_visual = gtk_drawing_area_new();
     gtk_widget_set_size_request(keyboard_visual, 400, 120);
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(keyboard_visual),
@@ -358,8 +358,12 @@ void VictusKeyboardControl::build_ui_for_keyboard_type() {
                                    this, nullptr);
     gtk_box_append(GTK_BOX(keyboard_page), keyboard_visual);
 
-    color_chooser = GTK_COLOR_CHOOSER(gtk_color_chooser_widget_new());
-    gtk_box_append(GTK_BOX(keyboard_page), GTK_WIDGET(color_chooser));
+    current_single_color = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    color_button = gtk_button_new_with_label("Choose Color…");
+    gtk_box_append(GTK_BOX(keyboard_page), color_button);
+    g_signal_connect(color_button, "clicked",
+                     G_CALLBACK(on_choose_color_clicked), this);
 
     apply_button = gtk_button_new_with_label("Apply Color");
     gtk_box_append(GTK_BOX(keyboard_page), apply_button);
@@ -448,11 +452,7 @@ void VictusKeyboardControl::draw_keyboard_visual(GtkDrawingArea *area,
   } else {
     // SINGLE_ZONE - all keys same color
     GdkRGBA color;
-    if (self->color_chooser) {
-      gtk_color_chooser_get_rgba(self->color_chooser, &color);
-    } else {
-      color = {1.0, 1.0, 1.0, 1.0};
-    }
+    color = self->current_single_color;
 
     cairo_set_source_rgb(cr, color.red, color.green, color.blue);
     for (int row = 0; row < kKeyboardRows; row++) {
@@ -521,51 +521,51 @@ void VictusKeyboardControl::on_keyboard_click(GtkGestureClick *gesture,
   if (row >= 0 && row < kKeyboardRows && col >= 0 && col < kKeyboardColumns) {
     int zone = get_zone_at_position(row, col);
 
-    // Open color chooser dialog for this zone
-    GtkWidget *toplevel =
-        GTK_WIDGET(gtk_widget_get_root(self->keyboard_visual));
-    GtkWidget *dialog = gtk_color_chooser_dialog_new("Choose Color for Zone",
-                                                     GTK_WINDOW(toplevel));
+    GtkWindow *toplevel = GTK_WINDOW(gtk_widget_get_root(self->keyboard_visual));
 
-    const GdkRGBA &dialog_color =
+    GtkColorDialog *dialog = gtk_color_dialog_new();
+    gtk_color_dialog_set_title(dialog, "Choose Color for Zone");
+    gtk_color_dialog_set_modal(dialog, TRUE);
+    gtk_color_dialog_set_with_alpha(dialog, FALSE);
+
+    const GdkRGBA &initial_color =
         self->keyboard_enabled ? self->zone_colors[zone]
                                : self->saved_zone_colors[zone];
-    gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(dialog), &dialog_color);
 
-    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    struct CallbackData {
+      VictusKeyboardControl *self;
+      int zone;
+      GtkColorDialog *dialog;
+    };
+    auto *cb = new CallbackData{self, zone, dialog};
 
-    // Use async dialog response
-    g_object_set_data(G_OBJECT(dialog), "zone-index", GINT_TO_POINTER(zone));
-    g_object_set_data(G_OBJECT(dialog), "self-ptr", self);
+    gtk_color_dialog_choose_rgba(
+        dialog, toplevel, &initial_color, nullptr,
+        [](GObject *source, GAsyncResult *result, gpointer user_data) {
+          auto *cb = static_cast<CallbackData *>(user_data);
+          GError *error = nullptr;
+          GdkRGBA *color = gtk_color_dialog_choose_rgba_finish(
+              GTK_COLOR_DIALOG(source), result, &error);
 
-    g_signal_connect(
-        dialog, "response",
-        G_CALLBACK(+[](GtkDialog *dialog, int response, gpointer user_data) {
-          if (response == GTK_RESPONSE_OK) {
-            VictusKeyboardControl *self = static_cast<VictusKeyboardControl *>(
-                g_object_get_data(G_OBJECT(dialog), "self-ptr"));
-            int zone = GPOINTER_TO_INT(
-                g_object_get_data(G_OBJECT(dialog), "zone-index"));
-
-            GdkRGBA color;
-            gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(dialog), &color);
-
-            if (!self->keyboard_enabled) {
-              self->saved_zone_colors[zone] = color;
-              gtk_window_destroy(GTK_WINDOW(dialog));
-              return;
+          if (color) {
+            if (!cb->self->keyboard_enabled) {
+              cb->self->saved_zone_colors[cb->zone] = *color;
+            } else {
+              cb->self->zone_colors[cb->zone] = *color;
+              cb->self->apply_zone_color_immediately(cb->zone);
+              cb->self->update_keyboard_visual();
+              VictusKeyboardControl::update_current_color_label(cb->self);
             }
-
-            self->zone_colors[zone] = color;
-            self->apply_zone_color_immediately(zone);
-            self->update_keyboard_visual();
-            VictusKeyboardControl::update_current_color_label(self);
+            gdk_rgba_free(color);
+          } else if (error && error->code != GTK_DIALOG_ERROR_DISMISSED) {
+            std::cerr << "Color dialog error: " << error->message << std::endl;
           }
-          gtk_window_destroy(GTK_WINDOW(dialog));
-        }),
-        nullptr);
 
-    gtk_widget_show(dialog);
+          if (error) g_error_free(error);
+          g_object_unref(cb->dialog);
+          delete cb;
+        },
+        cb);
   }
 }
 
@@ -666,18 +666,54 @@ void VictusKeyboardControl::on_toggle_clicked(GtkWidget *widget,
   VictusKeyboardControl::update_current_color_label(self);
 }
 
+void VictusKeyboardControl::on_choose_color_clicked(GtkWidget *widget,
+                                                    gpointer data) {
+  VictusKeyboardControl *self = static_cast<VictusKeyboardControl *>(data);
+  GtkWindow *toplevel = GTK_WINDOW(gtk_widget_get_root(widget));
+
+  GtkColorDialog *dialog = gtk_color_dialog_new();
+  gtk_color_dialog_set_title(dialog, "Choose Keyboard Color");
+  gtk_color_dialog_set_modal(dialog, TRUE);
+  gtk_color_dialog_set_with_alpha(dialog, FALSE);
+
+  struct CB { VictusKeyboardControl *self; GtkColorDialog *dialog; GtkWidget *button; };
+  auto *cb = new CB{self, dialog, widget};
+
+  gtk_color_dialog_choose_rgba(
+      dialog, toplevel, &self->current_single_color, nullptr,
+      [](GObject *source, GAsyncResult *result, gpointer user_data) {
+        auto *cb = static_cast<CB *>(user_data);
+        GError *error = nullptr;
+        GdkRGBA *color = gtk_color_dialog_choose_rgba_finish(
+            GTK_COLOR_DIALOG(source), result, &error);
+
+        if (color) {
+          cb->self->current_single_color = *color;
+          // Update button label to show chosen hex color
+          char hex[8];
+          g_snprintf(hex, sizeof(hex), "#%02X%02X%02X",
+                     (int)(color->red * 255),
+                     (int)(color->green * 255),
+                     (int)(color->blue * 255));
+          gtk_button_set_label(GTK_BUTTON(cb->button), hex);
+          cb->self->update_keyboard_visual();
+          gdk_rgba_free(color);
+        } else if (error && error->code != GTK_DIALOG_ERROR_DISMISSED) {
+          std::cerr << "Color dialog error: " << error->message << std::endl;
+        }
+
+        if (error) g_error_free(error);
+        g_object_unref(cb->dialog);
+        delete cb;
+      },
+      cb);
+}
+
 void VictusKeyboardControl::on_apply_color_clicked(GtkWidget *widget,
                                                    gpointer data) {
   VictusKeyboardControl *self = static_cast<VictusKeyboardControl *>(data);
 
-  if (!self->color_chooser) {
-    return;
-  }
-
-  GdkRGBA color;
-  gtk_color_chooser_get_rgba(GTK_COLOR_CHOOSER(self->color_chooser), &color);
-
-  self->update_keyboard_color(color);
+  self->update_keyboard_color(self->current_single_color);
   self->update_keyboard_visual();
 }
 
