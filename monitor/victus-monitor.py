@@ -151,11 +151,17 @@ class SustainedAlert:
         self.required_secs = required_secs
         self.above_since = None   # monotonic timestamp when streak started
         self.last_fired = 0.0
+        self.armed = True
 
     def update(self, temp_c, now):
         """Call every poll tick. Returns True exactly when alert should fire."""
         if temp_c is None:
             self.above_since = None
+            return False
+
+        if not self.armed:
+            if temp_c <= self.threshold_c - REARM_MARGIN_C:
+                self.armed = True
             return False
 
         if temp_c >= self.threshold_c:
@@ -164,7 +170,8 @@ class SustainedAlert:
             elapsed = now - self.above_since
             if elapsed >= self.required_secs and now - self.last_fired >= RATE_LIMIT_S:
                 self.last_fired = now
-                self.above_since = None   # reset so it must hold again to re-fire
+                self.above_since = None
+                self.armed = False
                 return True
         elif temp_c <= self.threshold_c - REARM_MARGIN_C:
             self.above_since = None
